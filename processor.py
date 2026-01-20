@@ -265,53 +265,50 @@ def _extract_pdf_tables(file) -> pd.DataFrame:
 
 def _parse_transactions_from_blob(text_blob: str) -> pd.DataFrame:
     """
-    Cognitive parser for messy statement text (not fixed sentences).
+    Improved cognitive parser for messy PDF text.
     Strategy:
-      - Identify date + amount in the same line OR within nearby context
-      - Use nearby words as description
-      - Infer income/expense from keywords (credit/debit) when possible
+      - Process line-by-line (not whole-page context)
+      - Extract date + amount per line
+      - Use that line as primary context
     """
     lines = [ln.strip() for ln in (text_blob or "").splitlines() if ln.strip()]
 
-    date_re = re.compile(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s[A-Za-z]{3,9}\s\d{4})")
-    amt_re = re.compile(r"((₹|INR|Rs\.?)\s?\d[\d,]*\.?\d*|\d[\d,]*\.?\d*\s?(INR|Rs\.?))", re.IGNORECASE)
+    date_re = re.compile(
+        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s[A-Za-z]{3,9}\s\d{4})"
+    )
+    amt_re = re.compile(
+        r"((₹|INR|Rs\.?)\s?\d[\d,]*\.?\d*|\d[\d,]*\.?\d*\s?(INR|Rs\.?))",
+        re.IGNORECASE
+    )
 
     rows = []
-    window = 2  # look around each line for context
 
-    for i, ln in enumerate(lines):
+    for ln in lines:
         d = date_re.search(ln)
         a = amt_re.search(ln)
 
-        # if not both on same line, try nearby context
-        context_lines = lines[max(0, i - window): min(len(lines), i + window + 1)]
-        context = " ".join(context_lines)
+        if not (d and a):
+            continue
 
-        if not d:
-            d = date_re.search(context)
-        if not a:
-            a = amt_re.search(context)
+        dt = parse_date(d.group(1))
+        amt = normalize_amount(a.group(1))
 
-        if d and a:
-            dt = parse_date(d.group(1))
-            amt = normalize_amount(a.group(1))
+        if pd.isna(amt) or dt is pd.NaT:
+            continue
 
-            # Description: remove date & amount from context and keep meaningful words
-            desc = clean_description_context(context)
+        # infer income/expense from SAME line
+        tx_type = guess_type_from_text(ln)
+        signed_amt = abs(amt) if tx_type == "Income" else -abs(amt)
 
-            # Infer type from context keywords
-            tx_type = guess_type_from_text(context)
-            signed_amt = abs(amt) if tx_type == "Income" else -abs(amt)
+        # derive merchant from same line
+        desc = clean_description_context(ln)
 
-            # Avoid duplicates: (date, amount, desc)
-            if pd.notna(amt) and dt is not pd.NaT:
-                rows.append([dt, desc, signed_amt, tx_type])
+        rows.append([dt, desc, signed_amt, tx_type])
 
     df = pd.DataFrame(rows, columns=["date", "description", "amount", "type"])
     if df.empty:
         return df
 
-    # Clean + dedupe
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["amount"] = df["amount"].apply(normalize_amount)
     df["amount"] = np.where(df["type"] == "Income", df["amount"].abs(), -df["amount"].abs())
