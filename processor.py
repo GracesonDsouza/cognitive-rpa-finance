@@ -3,12 +3,8 @@ import pandas as pd
 import numpy as np
 from dateutil import parser
 
-# PDF support
 import pdfplumber
 
-# ----------------------------
-# Cognitive rules (keyword-based categorization)
-# ----------------------------
 CATEGORY_RULES = {
     "Food": ["swiggy", "zomato", "restaurant", "cafe", "dominos", "kfc", "pizza", "starbucks"],
     "Travel": ["uber", "ola", "irctc", "metro", "flight", "makemytrip", "redbus"],
@@ -23,9 +19,7 @@ CATEGORY_RULES = {
 DEBIT_WORDS = ["debit", "debited", "paid", "purchase", "spent", "sent", "withdrawn", "dr", "payment", "bill", "emi"]
 CREDIT_WORDS = ["credit", "credited", "received", "refund", "salary", "cr", "deposit", "interest"]
 
-# ----------------------------
-# Helpers
-# ----------------------------
+
 def categorize(description: str) -> str:
     if not isinstance(description, str) or not description.strip():
         return "Other"
@@ -35,19 +29,19 @@ def categorize(description: str) -> str:
             return cat
     return "Other"
 
+
 def normalize_amount(x):
-    """Convert ₹ and commas to float. Keeps negative if present."""
     if pd.isna(x):
         return np.nan
     s = str(x).strip()
     s = s.replace(",", "").replace("₹", "")
     s = s.replace("INR", "").replace("Rs.", "").replace("Rs", "").strip()
-    # keep digits, dot, minus
     s = re.sub(r"[^\d\.\-]", "", s)
     try:
         return float(s)
     except Exception:
         return np.nan
+
 
 def parse_date(x):
     if pd.isna(x):
@@ -57,57 +51,43 @@ def parse_date(x):
     except Exception:
         return pd.NaT
 
+
 def guess_type_from_text(s: str) -> str:
     s_low = (s or "").lower()
     if any(w in s_low for w in CREDIT_WORDS):
         return "Income"
     if any(w in s_low for w in DEBIT_WORDS):
         return "Expense"
-    # Default for statements: Expense
     return "Expense"
 
-def merchant_normalize(s: str) -> str:
-    return (
-        str(s)
-        .lower()
-        .replace("&", " ")
-        .replace("-", " ")
-        .strip()
-    )
 
 def clean_description_context(text: str) -> str:
-    """
-    Try to derive a merchant/description from messy text by removing
-    dates, amounts, and common filler tokens.
-    """
     if not isinstance(text, str):
         return "Unknown"
     line = text
 
-    # remove date-like patterns
-    line = re.sub(r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s[A-Za-z]{3,9}\s\d{4})", " ", line)
-
-    # remove amounts / currency
+    line = re.sub(
+        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s[A-Za-z]{3,9}\s\d{4})",
+        " ",
+        line,
+    )
     line = re.sub(r"(₹|INR|Rs\.?)\s?\d[\d,]*\.?\d*", " ", line, flags=re.IGNORECASE)
     line = re.sub(r"\d[\d,]*\.?\d*\s?(INR|Rs\.?)", " ", line, flags=re.IGNORECASE)
 
-    # remove common banking fillers
-    line = re.sub(r"\b(on|at|to|from|via|upi|imps|neft|rtgs|txn|txnid|ref|no|a/c|ac|account)\b", " ", line, flags=re.IGNORECASE)
+    line = re.sub(
+        r"\b(on|at|to|from|via|upi|imps|neft|rtgs|txn|txnid|ref|no|a/c|ac|account)\b",
+        " ",
+        line,
+        flags=re.IGNORECASE,
+    )
     line = re.sub(r"\s+", " ", line).strip()
 
     if not line:
         return "Unknown"
     return line[:70]
 
-# ----------------------------
-# Recurring detection
-# ----------------------------
+
 def detect_recurring(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Recurring detection (safe logic):
-    - Same normalized merchant appears in 2+ different months
-    - Amount roughly stable (std dev below tolerance)
-    """
     df = df.copy()
     df["merchant_norm"] = (
         df["description"]
@@ -130,7 +110,7 @@ def detect_recurring(df: pd.DataFrame) -> pd.DataFrame:
         mean_amt = g["abs_amount"].mean()
         std_amt = g["abs_amount"].std(ddof=0)
 
-        tol = (mean_amt * 0.10) + 50  # 10% + ₹50 buffer
+        tol = (mean_amt * 0.10) + 50
         is_rec = (months >= 2) and (std_amt <= tol)
 
         if is_rec:
@@ -138,9 +118,7 @@ def detect_recurring(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-# ----------------------------
-# CSV Input
-# ----------------------------
+
 def load_csv(file) -> pd.DataFrame:
     df = pd.read_csv(file)
     df.columns = [c.strip().lower() for c in df.columns]
@@ -159,51 +137,35 @@ def load_csv(file) -> pd.DataFrame:
     df = df.dropna(subset=["date", "amount"])
     return detect_recurring(df)
 
-# ----------------------------
-# Unstructured Text Input (SMS/Email)
-# ----------------------------
-def extract_from_text(text: str) -> pd.DataFrame:
-    """
-    Handles natural sentences. Examples:
-      'Your account was debited with INR 499 at Netflix on 05 Feb 2025.'
-      'Payment of Rs. 1250 successful to Swiggy via UPI on 12 Feb 2025.'
-      'Salary credited INR 50000 on 01-02-2025.'
-      'Uber ride of INR 320 completed on 2025-02-18'
-    """
-    rows = []
 
+def extract_from_text(text: str) -> pd.DataFrame:
+    rows = []
     for line in (text or "").splitlines():
         line = line.strip()
         if not line:
             continue
 
-        # Date patterns
         date_match = re.search(
             r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s[A-Za-z]{3,9}\s\d{4})",
-            line
+            line,
         )
 
-        # Amount patterns
         amt_match = re.search(
             r"((₹|INR|Rs\.?)\s?\d[\d,]*\.?\d*|\d[\d,]*\.?\d*\s?(INR|Rs\.?))",
             line,
-            re.IGNORECASE
+            re.IGNORECASE,
         )
 
-        # Merchant patterns
         merch_match = re.search(r"(?:at|to|from)\s+([A-Za-z0-9 &]+)", line, re.IGNORECASE)
 
         if date_match and amt_match:
             dt = parse_date(date_match.group(1))
             amt = normalize_amount(amt_match.group(1))
 
-            merchant = "Unknown"
             if merch_match:
                 merchant = merch_match.group(1).strip()
-                # stop at 'on/via/.' etc
                 merchant = re.split(r"\bon\b|\bvia\b|[.,]", merchant, flags=re.IGNORECASE)[0].strip()
             else:
-                # fallback: derive from sentence context
                 merchant = clean_description_context(line)
 
             tx_type = guess_type_from_text(line)
@@ -218,19 +180,14 @@ def extract_from_text(text: str) -> pd.DataFrame:
 
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["amount"] = df["amount"].apply(normalize_amount)
-
-    # re-apply sign based on type (because normalize_amount may remove it)
     df["amount"] = np.where(df["type"] == "Income", df["amount"].abs(), -df["amount"].abs())
-
     df["category"] = df["description"].apply(categorize)
+
     df = df.dropna(subset=["date", "amount"])
     return detect_recurring(df)
 
-# ----------------------------
-# PDF Input (Unstructured)
-# ----------------------------
+
 def _extract_pdf_text(file) -> str:
-    """Extract all text from PDF pages."""
     chunks = []
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
@@ -239,11 +196,8 @@ def _extract_pdf_text(file) -> str:
                 chunks.append(t)
     return "\n".join(chunks)
 
+
 def _extract_pdf_tables(file) -> pd.DataFrame:
-    """
-    Try to extract tables. If tables look like statements, convert to a dataframe.
-    This is best-effort — different banks differ a lot.
-    """
     rows = []
     with pdfplumber.open(file) as pdf:
         for page in pdf.pages:
@@ -252,7 +206,6 @@ def _extract_pdf_tables(file) -> pd.DataFrame:
                 for r in table:
                     if not r:
                         continue
-                    # join row to one string for scanning
                     row_str = " ".join([str(x) for x in r if x is not None]).strip()
                     if row_str:
                         rows.append(row_str)
@@ -260,16 +213,15 @@ def _extract_pdf_tables(file) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
 
-    # Parse table rows using the same “blob” logic below
     return _parse_transactions_from_blob("\n".join(rows))
+
 
 def _parse_transactions_from_blob(text_blob: str) -> pd.DataFrame:
     """
-    Improved cognitive parser for messy PDF text.
-    Strategy:
-      - Process line-by-line (not whole-page context)
-      - Extract date + amount per line
-      - Use that line as primary context
+    Improved PDF parser:
+    - Line-by-line parsing (prevents merging multiple transactions into one)
+    - Extract date + amount per line
+    - Infer income/expense from the same line
     """
     lines = [ln.strip() for ln in (text_blob or "").splitlines() if ln.strip()]
 
@@ -278,29 +230,23 @@ def _parse_transactions_from_blob(text_blob: str) -> pd.DataFrame:
     )
     amt_re = re.compile(
         r"((₹|INR|Rs\.?)\s?\d[\d,]*\.?\d*|\d[\d,]*\.?\d*\s?(INR|Rs\.?))",
-        re.IGNORECASE
+        re.IGNORECASE,
     )
 
     rows = []
-
     for ln in lines:
         d = date_re.search(ln)
         a = amt_re.search(ln)
-
         if not (d and a):
             continue
 
         dt = parse_date(d.group(1))
         amt = normalize_amount(a.group(1))
-
         if pd.isna(amt) or dt is pd.NaT:
             continue
 
-        # infer income/expense from SAME line
         tx_type = guess_type_from_text(ln)
         signed_amt = abs(amt) if tx_type == "Income" else -abs(amt)
-
-        # derive merchant from same line
         desc = clean_description_context(ln)
 
         rows.append([dt, desc, signed_amt, tx_type])
@@ -320,17 +266,11 @@ def _parse_transactions_from_blob(text_blob: str) -> pd.DataFrame:
     df["category"] = df["description"].apply(categorize)
     return detect_recurring(df)
 
+
 def extract_from_pdf(file) -> pd.DataFrame:
-    """
-    End-to-end PDF extraction:
-      1) Try tables
-      2) If tables fail/empty, parse raw text
-    """
-    # tables first (often best)
     df_tables = _extract_pdf_tables(file)
     if df_tables is not None and not df_tables.empty:
         return df_tables
 
-    # fallback to text blob
     text = _extract_pdf_text(file)
     return _parse_transactions_from_blob(text)
