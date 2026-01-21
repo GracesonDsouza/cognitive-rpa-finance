@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
-import matplotlib.pyplot as plt
 import numpy as np
-
+import matplotlib.pyplot as plt
 
 from processor import load_csv, extract_from_text, extract_from_pdf
 
@@ -69,9 +68,8 @@ with st.sidebar:
             height=240,
             placeholder=(
                 "Your account was debited with INR 499 at Netflix on 05 Jan 2025.\n"
-                "Your account was debited with INR 499 at Netflix on 05 Feb 2025.\n"
-                "Payment of Rs. 15000 successful to HDFC Bank EMI on 10 Jan 2025.\n"
                 "Payment of Rs. 15000 successful to HDFC Bank EMI on 10 Feb 2025.\n"
+                "Rent paid INR 18000 on 03 Feb 2025.\n"
                 "Salary credited INR 50000 on 01-02-2025."
             ),
         )
@@ -79,9 +77,10 @@ with st.sidebar:
 
     else:
         uploaded = st.file_uploader("Upload PDF statement", type=["pdf"])
-        st.caption("Best-effort extraction: tables → text → inference.")
+        st.caption("Best-effort extraction: tables → text → transaction inference.")
 
     process = st.button("🚀 Process Data", use_container_width=True)
+
 
 # ---------- Helpers ----------
 def to_csv_download(df: pd.DataFrame) -> bytes:
@@ -115,21 +114,22 @@ def make_monthly_cashflow_chart(df):
 
 
 def get_top_merchants(df, n=5):
-    d = df.copy()
-    d = d[d["amount"] < 0]  # expenses only
+    """
+    ✅ FIX: group by merchant_norm (canonical identity), NOT raw description.
+    """
+    d = df[df["amount"] < 0].copy()  # expenses only
     if d.empty:
         return pd.Series(dtype=float)
 
     d["abs_amt"] = d["amount"].abs()
 
-    # Group by normalized merchant, not raw description
+    # df already has merchant_norm from processor.detect_recurring()
     top = (
         d.groupby("merchant_norm")["abs_amt"]
         .sum()
         .sort_values(ascending=False)
         .head(n)
     )
-
     return top
 
 
@@ -185,14 +185,17 @@ def build_smart_alerts(df, insights):
 
     # recurring burden
     if insights["recurring_ratio"] >= 50:
-        alerts.append(f"Recurring expenses are high (~{insights['recurring_ratio']:.0f}% of total spending). Consider trimming subscriptions or refinancing EMIs.")
+        alerts.append(
+            f"Recurring expenses are high (~{insights['recurring_ratio']:.0f}% of total spending). "
+            "Consider trimming subscriptions or reviewing EMIs."
+        )
     elif insights["recurring_ratio"] >= 30:
-        alerts.append(f"Recurring expenses are moderate (~{insights['recurring_ratio']:.0f}%). Keep an eye on EMIs/subscriptions.")
+        alerts.append(f"Recurring expenses are moderate (~{insights['recurring_ratio']:.0f}%). Track EMIs/subscriptions.")
 
     # negative cashflow months
     if insights["negative_months"]:
         months = ", ".join(insights["negative_months"][:4])
-        alerts.append(f"Net cashflow went negative in: {months}. This indicates spending exceeded income in those months.")
+        alerts.append(f"Net cashflow went negative in: {months}. Spending exceeded income in those months.")
 
     # large expense alerts (top 3)
     d = df[df["amount"] < 0].copy()
@@ -202,16 +205,15 @@ def build_smart_alerts(df, insights):
         for _, r in top_large.iterrows():
             alerts.append(f"Large expense spotted: ₹{r['abs_amt']:,.0f} on '{r['description']}' ({r['category']}).")
 
-    # subscription/EMI reminders if recurring exists
+    # recurring examples
     rec = df[df["is_recurring"] == True].copy()
     if not rec.empty:
-        # pick a couple of examples
-        examples = rec.sort_values("date").groupby("category").head(1)
+        examples = rec.sort_values("date").groupby("merchant_norm").head(1)
         for _, r in examples.head(2).iterrows():
-            alerts.append(f"Recurring detected: '{r['description']}' likely repeats monthly (Category: {r['category']}).")
+            alerts.append(f"Recurring pattern: '{r['merchant_norm']}' likely repeats monthly (Category: {r['category']}).")
 
-    # keep alerts concise
     return alerts[:7]
+
 
 # ---------- Run ----------
 if process:
@@ -239,24 +241,22 @@ if process:
             st.error("No transactions detected. Try a different file/text format.")
             st.stop()
 
-        # compute insights
         insights = compute_insights(df)
 
-        # ---------- Top Row: Profile + Consent ----------
+        # ---------- Profile + Consent ----------
         a, b = st.columns([1, 2])
-
         with a:
             st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.image("https://i.pravatar.cc/140?img=12", width=110)  # demo avatar
+            st.image("https://i.pravatar.cc/140?img=12", width=110)
             st.markdown("**Rahul Sharma**")
             st.markdown('<div class="small">Young professional • Bengaluru</div>', unsafe_allow_html=True)
-            st.markdown('<div class="small">Primary Bank: HDFC (Demo)</div>', unsafe_allow_html=True)
+            st.markdown('<div class="small">Primary Bank: Demo Statement</div>', unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
 
         with b:
             st.success(
-                "🔐 **Consent & Privacy Notice**: This prototype processes documents **only after user consent**. "
-                "No real banking login is used. Files are for academic demo purposes."
+                "🔐 **Consent & Privacy Notice**: Prototype processes files **only after user consent**. "
+                "No banking login is used. Demo files are for academic purposes."
             )
 
         st.write("")
@@ -311,7 +311,7 @@ if process:
         if rec.empty:
             st.info("No recurring payments detected. Try multi-month entries.")
         else:
-            st.dataframe(rec[["date", "description", "amount", "category"]], use_container_width=True)
+            st.dataframe(rec[["date", "description", "merchant_norm", "amount", "category"]], use_container_width=True)
 
         # ---------- All Transactions ----------
         st.subheader("🧾 All Transactions")
