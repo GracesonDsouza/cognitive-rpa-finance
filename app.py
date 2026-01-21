@@ -116,12 +116,21 @@ def make_monthly_cashflow_chart(df):
 
 def get_top_merchants(df, n=5):
     d = df.copy()
-    d["abs_amt"] = d["amount"].abs()
-    # prefer expenses for merchant ranking
-    d = d[d["amount"] < 0]
+    d = d[d["amount"] < 0]  # expenses only
     if d.empty:
         return pd.Series(dtype=float)
-    return d.groupby("description")["abs_amt"].sum().sort_values(ascending=False).head(n)
+
+    d["abs_amt"] = d["amount"].abs()
+
+    # Group by normalized merchant, not raw description
+    top = (
+        d.groupby("merchant_norm")["abs_amt"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(n)
+    )
+
+    return top
 
 
 def compute_insights(df):
