@@ -4,7 +4,11 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import IsolationForest
+
+try:
+    from sklearn.ensemble import IsolationForest
+except Exception:
+    IsolationForest = None
 
 try:
     import pdfplumber
@@ -308,7 +312,6 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
 
     out = df.copy()
 
-    # First priority: transaction ID if available
     has_txn_id = out["transaction_id"].fillna("").astype(str).str.strip() != ""
     with_id = out[has_txn_id].copy()
     without_id = out[~has_txn_id].copy()
@@ -316,7 +319,6 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     if not with_id.empty:
         with_id = with_id.drop_duplicates(subset=["transaction_id"], keep="first")
 
-    # Fallback duplicate logic when no transaction ID exists
     if not without_id.empty:
         without_id = without_id.drop_duplicates(
             subset=["date", "amount", "merchant_norm", "type"],
@@ -557,13 +559,16 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     expense_idx = out[out["type"] == "expense"].index
     expense_df = out.loc[expense_idx].copy()
 
-    if len(expense_df) < 5:
-        if not expense_df.empty:
-            threshold = expense_df["amount"].quantile(0.90)
-            flagged = expense_df[expense_df["amount"] >= threshold].index
-            out.loc[flagged, "is_anomaly"] = True
-            out.loc[flagged, "anomaly_score"] = 1.0
-            out.loc[flagged, "anomaly_reason"] = "high-value expense"
+    if expense_df.empty:
+        return out
+
+    # Safe fallback if sklearn is unavailable or dataset is too small
+    if IsolationForest is None or len(expense_df) < 5:
+        threshold = expense_df["amount"].quantile(0.90)
+        flagged = expense_df[expense_df["amount"] >= threshold].index
+        out.loc[flagged, "is_anomaly"] = True
+        out.loc[flagged, "anomaly_score"] = 1.0
+        out.loc[flagged, "anomaly_reason"] = "high-value expense"
         return out
 
     merchant_freq = expense_df["merchant_norm"].value_counts()
@@ -590,6 +595,7 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
 
     amount_threshold = expense_df["amount"].quantile(0.95)
     rare_merchants = set(merchant_freq[merchant_freq <= 1].index)
+
     for idx in expense_df.index:
         if out.loc[idx, "is_anomaly"]:
             out.loc[idx, "anomaly_reason"] = _build_anomaly_reason(out.loc[idx], amount_threshold, rare_merchants)
@@ -606,11 +612,16 @@ def enrich_transactions(df: pd.DataFrame, memory_file: str = MEMORY_FILE) -> pd.
         ])
 
     out = df.copy()
+    before_count = len(out)
+
     out = remove_duplicates(out)
+    after_count = len(out)
 
     memory_df = load_memory(memory_file)
     out = apply_memory_learning(out, memory_df)
     out = detect_recurring(out)
     out = detect_anomalies(out)
 
-    return out.sort_values("date", ascending=True, na_position="last").reset_index(drop=True)
+    out = out.sort_values("date", ascending=True, na_position="last").reset_index(drop=True)
+    out.attrs["duplicates_removed"] = before_count - after_count
+    return out
