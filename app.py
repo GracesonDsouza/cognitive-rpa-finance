@@ -16,89 +16,157 @@ from processor import (
 
 st.set_page_config(
     page_title="Cognitive RPA for Personal Finance",
-    page_icon="💚",
+    page_icon="🟢",
     layout="wide",
 )
 
 # =========================================================
-# THEME / STYLING
+# NVIDIA-STYLE THEME
 # =========================================================
 
 st.markdown(
     """
     <style>
+    :root {
+        --bg: #0a0a0a;
+        --panel: #111111;
+        --panel-2: #161616;
+        --panel-3: #1b1b1b;
+        --border: #242424;
+        --text: #f5f5f5;
+        --muted: #a1a1aa;
+        --green: #76b900;
+        --green-2: #8bd80a;
+        --green-soft: rgba(118, 185, 0, 0.12);
+        --white-soft: rgba(255,255,255,0.04);
+    }
+
     .stApp {
-        background: linear-gradient(180deg, #f7fcf8 0%, #edf8ef 100%);
+        background: linear-gradient(180deg, #070707 0%, #0b0b0b 100%);
+        color: var(--text);
+    }
+
+    [data-testid="stAppViewContainer"] {
+        background: linear-gradient(180deg, #070707 0%, #0b0b0b 100%);
+    }
+
+    [data-testid="stHeader"] {
+        background: rgba(0,0,0,0);
+    }
+
+    [data-testid="stSidebar"] {
+        background: #0b0b0b;
+        border-right: 1px solid var(--border);
+    }
+
+    section[data-testid="stSidebar"] * {
+        color: var(--text) !important;
     }
 
     .main-title {
-        font-size: 2.1rem;
+        font-size: 2.2rem;
         font-weight: 800;
-        color: #14532d;
+        color: white;
         margin-bottom: 0.2rem;
+        letter-spacing: -0.02em;
+    }
+
+    .accent-line {
+        width: 92px;
+        height: 4px;
+        background: linear-gradient(90deg, var(--green), var(--green-2));
+        border-radius: 999px;
+        margin: 0.4rem 0 0.9rem 0;
     }
 
     .sub-title {
-        color: #3f3f46;
-        font-size: 0.98rem;
+        color: var(--muted);
+        font-size: 1rem;
         margin-bottom: 1rem;
+        max-width: 1100px;
     }
 
     .section-card {
-        background: white;
-        border: 1px solid #d1fae5;
-        border-radius: 18px;
+        background: linear-gradient(180deg, #101010 0%, #121212 100%);
+        border: 1px solid var(--border);
+        border-radius: 20px;
         padding: 18px 18px 14px 18px;
-        box-shadow: 0 4px 16px rgba(16, 24, 40, 0.04);
+        box-shadow: 0 12px 30px rgba(0,0,0,0.22);
+        margin-bottom: 16px;
+    }
+
+    .section-card-strong {
+        background: linear-gradient(180deg, #0f0f0f 0%, #141414 100%);
+        border: 1px solid rgba(118,185,0,0.25);
+        border-radius: 22px;
+        padding: 18px;
+        box-shadow: 0 0 0 1px rgba(118,185,0,0.06), 0 18px 36px rgba(0,0,0,0.28);
         margin-bottom: 16px;
     }
 
     .soft-card {
-        background: #f0fdf4;
-        border: 1px solid #bbf7d0;
-        border-radius: 16px;
+        background: linear-gradient(180deg, #131313 0%, #171717 100%);
+        border: 1px solid var(--border);
+        border-radius: 18px;
         padding: 14px 16px;
         margin-bottom: 12px;
     }
 
-    .health-card {
-        background: linear-gradient(135deg, #14532d 0%, #166534 50%, #15803d 100%);
+    .hero-card {
+        background:
+            radial-gradient(circle at top right, rgba(118,185,0,0.16), transparent 28%),
+            linear-gradient(135deg, #101010 0%, #151515 60%, #111111 100%);
         color: white;
-        border-radius: 20px;
-        padding: 22px;
-        box-shadow: 0 10px 24px rgba(21, 128, 61, 0.20);
-        min-height: 180px;
+        border-radius: 24px;
+        border: 1px solid rgba(118,185,0,0.24);
+        padding: 24px;
+        box-shadow: 0 18px 40px rgba(0,0,0,0.30);
+        min-height: 190px;
     }
 
-    .health-label {
+    .hero-label {
         font-size: 0.95rem;
-        opacity: 0.9;
+        color: #d4d4d8;
     }
 
-    .health-score {
-        font-size: 3rem;
+    .hero-score {
+        font-size: 3.2rem;
         font-weight: 800;
-        line-height: 1.1;
-        margin-top: 6px;
-    }
-
-    .health-band {
-        font-size: 1.05rem;
-        font-weight: 600;
-        margin-top: 6px;
-    }
-
-    .health-conf {
-        font-size: 0.95rem;
-        opacity: 0.95;
+        line-height: 1.05;
         margin-top: 8px;
+        color: white;
+    }
+
+    .hero-band {
+        font-size: 1.05rem;
+        font-weight: 700;
+        margin-top: 8px;
+        color: var(--green-2);
+    }
+
+    .hero-conf {
+        font-size: 0.95rem;
+        margin-top: 10px;
+        color: #e4e4e7;
+    }
+
+    .box-title {
+        font-size: 1.05rem;
+        font-weight: 700;
+        color: white;
+        margin-bottom: 10px;
+    }
+
+    .small-note {
+        color: var(--muted);
+        font-size: 0.92rem;
     }
 
     .mini-pill {
         display: inline-block;
-        background: #dcfce7;
-        color: #166534;
-        border: 1px solid #bbf7d0;
+        background: rgba(118,185,0,0.12);
+        color: #b7f34d;
+        border: 1px solid rgba(118,185,0,0.28);
         border-radius: 999px;
         padding: 5px 10px;
         font-size: 0.82rem;
@@ -107,24 +175,20 @@ st.markdown(
         margin-bottom: 6px;
     }
 
-    .box-title {
-        font-size: 1.05rem;
-        font-weight: 700;
-        color: #166534;
-        margin-bottom: 10px;
-    }
-
-    .small-note {
-        color: #52525b;
-        font-size: 0.90rem;
-    }
-
     div[data-testid="stMetric"] {
-        background: white;
-        border: 1px solid #d1fae5;
+        background: linear-gradient(180deg, #101010 0%, #141414 100%);
+        border: 1px solid var(--border);
         padding: 10px 12px;
-        border-radius: 16px;
-        box-shadow: 0 3px 12px rgba(16,24,40,0.03);
+        border-radius: 18px;
+        box-shadow: 0 8px 20px rgba(0,0,0,0.18);
+    }
+
+    div[data-testid="stMetricLabel"] {
+        color: #d4d4d8;
+    }
+
+    div[data-testid="stMetricValue"] {
+        color: white;
     }
 
     .stTabs [data-baseweb="tab-list"] {
@@ -132,15 +196,67 @@ st.markdown(
     }
 
     .stTabs [data-baseweb="tab"] {
-        background: #ecfdf5;
-        border-radius: 12px;
-        border: 1px solid #bbf7d0;
+        background: #111111;
+        border-radius: 13px;
+        border: 1px solid var(--border);
         padding: 10px 16px;
+        color: #e4e4e7;
     }
 
     .stTabs [aria-selected="true"] {
-        background: #166534 !important;
+        background: linear-gradient(180deg, #151515 0%, #191919 100%) !important;
         color: white !important;
+        border: 1px solid rgba(118,185,0,0.35) !important;
+        box-shadow: inset 0 0 0 1px rgba(118,185,0,0.10);
+    }
+
+    .stButton > button {
+        border-radius: 12px !important;
+        border: 1px solid rgba(118,185,0,0.35) !important;
+        background: linear-gradient(180deg, #171717 0%, #121212 100%) !important;
+        color: white !important;
+        font-weight: 600 !important;
+    }
+
+    .stButton > button:hover {
+        border-color: rgba(118,185,0,0.60) !important;
+        box-shadow: 0 0 0 1px rgba(118,185,0,0.10), 0 8px 20px rgba(0,0,0,0.18);
+    }
+
+    .stDownloadButton > button {
+        border-radius: 12px !important;
+        border: 1px solid rgba(118,185,0,0.35) !important;
+        background: linear-gradient(180deg, #171717 0%, #121212 100%) !important;
+        color: white !important;
+        font-weight: 600 !important;
+    }
+
+    .stTextInput input,
+    .stTextArea textarea,
+    .stNumberInput input,
+    .stSelectbox div[data-baseweb="select"] > div,
+    .stMultiSelect div[data-baseweb="select"] > div {
+        background: #111111 !important;
+        color: white !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 12px !important;
+    }
+
+    .stDataFrame, .stTable {
+        border-radius: 16px;
+        overflow: hidden;
+    }
+
+    .stAlert {
+        border-radius: 14px !important;
+    }
+
+    .stCodeBlock {
+        border-radius: 16px !important;
+    }
+
+    hr {
+        border-color: var(--border);
     }
     </style>
     """,
@@ -182,7 +298,8 @@ def to_csv_bytes(df):
     return df.to_csv(index=False).encode("utf-8")
 
 def render_header():
-    st.markdown('<div class="main-title">💚 Cognitive RPA for Personal Finance Data Consolidation</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-title">Cognitive RPA for Personal Finance Data Consolidation</div>', unsafe_allow_html=True)
+    st.markdown('<div class="accent-line"></div>', unsafe_allow_html=True)
     st.markdown(
         '<div class="sub-title">Upload CSVs, PDFs, and text. Consolidate transactions, validate data quality, remove duplicates, categorize merchants, detect recurring spending, flag anomalies, track budgets, and compute a confidence-aware financial health score.</div>',
         unsafe_allow_html=True,
@@ -191,11 +308,11 @@ def render_header():
 def render_health_card(score, band, confidence_label, confidence_pct):
     st.markdown(
         f"""
-        <div class="health-card">
-            <div class="health-label">Financial Health Score</div>
-            <div class="health-score">{score}/100</div>
-            <div class="health-band">{band}</div>
-            <div class="health-conf">Confidence: <b>{confidence_label}</b> ({confidence_pct}%)</div>
+        <div class="hero-card">
+            <div class="hero-label">Financial Health Score</div>
+            <div class="hero-score">{score}/100</div>
+            <div class="hero-band">{band}</div>
+            <div class="hero-conf">Confidence: <b>{confidence_label}</b> ({confidence_pct}%)</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -237,7 +354,7 @@ def prepare_duplicate_display(df):
 
 def build_budget_editor():
     st.markdown('<div class="box-title">Budget Setup</div>', unsafe_allow_html=True)
-    st.markdown('<div class="small-note">Use the controls below instead of typing a raw text budget map.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="small-note">Add and edit budgets using structured controls instead of a raw text box.</div>', unsafe_allow_html=True)
 
     if "budget_rows" not in st.session_state:
         st.session_state["budget_rows"] = [
@@ -254,6 +371,7 @@ def build_budget_editor():
         new_budget = st.number_input("Budget Amount", min_value=0.0, step=500.0, value=1000.0, key="new_budget_amount")
 
     add_col, clear_col = st.columns([1, 1])
+
     with add_col:
         if st.button("Add / Update Budget", use_container_width=True):
             updated = False
@@ -469,7 +587,7 @@ with st.sidebar:
 # =========================================================
 
 with st.container():
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
+    st.markdown('<div class="section-card-strong">', unsafe_allow_html=True)
     budget_editor_df, budget_map = build_budget_editor()
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -510,7 +628,7 @@ confidence_pct = health.get("quality_confidence", 0)
 # TOP DASHBOARD
 # =========================================================
 
-top1, top2 = st.columns([1.15, 2])
+top1, top2 = st.columns([1.12, 2])
 
 with top1:
     render_health_card(score, band, confidence_label, confidence_pct)
@@ -573,7 +691,12 @@ with tab1:
                         dir_summary,
                         names="direction",
                         values="amount",
-                        title="Income vs Expense Distribution"
+                        title="Income vs Expense Distribution",
+                    )
+                    fig.update_layout(
+                        paper_bgcolor="#111111",
+                        plot_bgcolor="#111111",
+                        font_color="white",
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -590,7 +713,12 @@ with tab1:
                         cat_summary.head(10),
                         x="category",
                         y="amount",
-                        title="Top Spending Categories"
+                        title="Top Spending Categories",
+                    )
+                    fig.update_layout(
+                        paper_bgcolor="#111111",
+                        plot_bgcolor="#111111",
+                        font_color="white",
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -609,7 +737,12 @@ with tab1:
                         merch_summary.head(10),
                         x="normalized_merchant",
                         y="amount",
-                        title="Top Merchants by Amount"
+                        title="Top Merchants by Amount",
+                    )
+                    fig.update_layout(
+                        paper_bgcolor="#111111",
+                        plot_bgcolor="#111111",
+                        font_color="white",
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -626,7 +759,12 @@ with tab1:
                         trend,
                         x="date",
                         y="amount",
-                        title="Transaction Amount Trend"
+                        title="Transaction Amount Trend",
+                    )
+                    fig.update_layout(
+                        paper_bgcolor="#111111",
+                        plot_bgcolor="#111111",
+                        font_color="white",
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
@@ -725,7 +863,6 @@ with tab3:
                 )
                 rec_summary["average_amount"] = rec_summary["average_amount"].round(2)
                 rec_summary["total_amount"] = rec_summary["total_amount"].round(2)
-
                 st.dataframe(rec_summary, use_container_width=True, height=280)
 
         with right:
@@ -753,6 +890,11 @@ with tab3:
                 source_summary = tx["source"].value_counts(dropna=False).reset_index()
                 source_summary.columns = ["source", "count"]
                 fig = px.bar(source_summary, x="source", y="count", title="Source Mix")
+                fig.update_layout(
+                    paper_bgcolor="#111111",
+                    plot_bgcolor="#111111",
+                    font_color="white",
+                )
                 st.plotly_chart(fig, use_container_width=True)
 
         with low2:
@@ -769,6 +911,11 @@ with tab3:
                     path=["category"],
                     values="amount",
                     title="Category Distribution"
+                )
+                fig.update_layout(
+                    paper_bgcolor="#111111",
+                    plot_bgcolor="#111111",
+                    font_color="white",
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
@@ -815,6 +962,11 @@ with tab4:
                 x="category",
                 y="spent",
                 title="Budget Spend by Category"
+            )
+            fig.update_layout(
+                paper_bgcolor="#111111",
+                plot_bgcolor="#111111",
+                font_color="white",
             )
             st.plotly_chart(fig, use_container_width=True)
 
