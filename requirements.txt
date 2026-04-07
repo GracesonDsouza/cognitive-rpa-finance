@@ -1,6 +1,6 @@
 streamlit
 pandas
 numpy
-python-dateutil
+scikit-learn
+plotly
 pdfplumber
-matplotlib
