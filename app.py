@@ -1,573 +1,581 @@
+import json
+from io import StringIO
+
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
 
 from processor import (
-    MEMORY_FILE,
-    combine_sources,
-    enrich_transactions,
-    extract_from_pdf,
-    extract_from_text,
-    get_uncertain_transactions,
-    load_csv,
-    load_memory,
-    save_memory_entry,
+    process_financial_data,
+    remember_category,
+    remember_merchant_alias,
+    load_learning_memory,
 )
 
-st.set_page_config(page_title="Cognitive RPA Finance", layout="wide")
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 
-st.markdown("""
-<style>
-.block-container {
-    padding-top: 1.2rem;
-    padding-bottom: 1rem;
-    max-width: 1400px;
-}
-.main-title {
-    font-size: 2.2rem;
-    font-weight: 800;
-    color: #0f172a;
-    margin-bottom: 0.15rem;
-}
-.sub-title {
-    font-size: 1rem;
-    color: #475569;
-    margin-bottom: 1rem;
-}
-.hero-card {
-    background: linear-gradient(135deg, #e0f2fe 0%, #eef2ff 55%, #f8fafc 100%);
-    border: 1px solid #dbeafe;
-    padding: 20px;
-    border-radius: 20px;
-    margin-bottom: 16px;
-}
-.badge {
-    display: inline-block;
-    background: #0ea5e9;
-    color: white;
-    padding: 6px 12px;
-    border-radius: 999px;
-    font-size: 0.78rem;
-    margin-right: 8px;
-    margin-bottom: 8px;
-}
-.metric-box {
-    background: white;
-    border: 1px solid #e2e8f0;
-    border-radius: 16px;
-    padding: 16px;
-    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04);
-}
-.metric-label {
-    font-size: 0.9rem;
-    color: #64748b;
-}
-.metric-value {
-    font-size: 1.7rem;
-    font-weight: 800;
-    color: #0f172a;
-    margin-top: 4px;
-}
-.section-card {
-    background: white;
-    border: 1px solid #e2e8f0;
-    border-radius: 16px;
-    padding: 16px;
-    margin-bottom: 14px;
-}
-.small-note {
-    color: #64748b;
-    font-size: 0.9rem;
-}
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(
+    page_title="Cognitive RPA for Personal Finance",
+    page_icon="💰",
+    layout="wide",
+)
 
+# =========================================================
+# HELPERS
+# =========================================================
 
-CATEGORIES = [
-    "Food", "Travel", "Rent", "EMI/Loan", "Subscriptions",
-    "Shopping", "Bills/Utilities", "Investment", "Other", "Income"
-]
+def safe_dataframe(df):
+    if df is None:
+        return pd.DataFrame()
+    return df.copy()
 
+def metric_card(label, value, help_text=None):
+    st.metric(label=label, value=value, help=help_text)
 
-def format_inr(x):
-    return f"₹{x:,.2f}"
+def make_download_csv(df):
+    if df is None or df.empty:
+        return None
+    return df.to_csv(index=False).encode("utf-8")
 
+def normalize_budget_input(text):
+    """
+    Budget input format:
+    Groceries:5000
+    Rent:15000
+    Food & Dining:3000
+    """
+    budget_map = {}
+    if not text:
+        return budget_map
 
-def metric_card(title, value):
+    lines = text.strip().splitlines()
+    for line in lines:
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key = key.strip()
+            value = value.strip()
+            try:
+                budget_map[key] = float(value)
+            except Exception:
+                continue
+    return budget_map
+
+def show_empty_state():
+    st.info("Upload at least one CSV/PDF or paste transaction text to begin analysis.")
+
+def health_color(score):
+    try:
+        score = int(score)
+    except Exception:
+        return "gray"
+    if score >= 80:
+        return "green"
+    elif score >= 65:
+        return "blue"
+    elif score >= 50:
+        return "orange"
+    return "red"
+
+def render_health_badge(score, band, confidence_label, confidence_pct):
+    color = health_color(score)
     st.markdown(
         f"""
-        <div class="metric-box">
-            <div class="metric-label">{title}</div>
-            <div class="metric-value">{value}</div>
+        <div style="
+            border-radius:16px;
+            padding:18px;
+            background-color:#f8f9fa;
+            border:1px solid #e6e6e6;
+            margin-bottom:10px;">
+            <div style="font-size:15px; color:#666;">Financial Health Score</div>
+            <div style="font-size:42px; font-weight:700; color:{color}; line-height:1.2;">{score}/100</div>
+            <div style="font-size:16px; margin-top:4px;"><b>{band}</b></div>
+            <div style="font-size:14px; color:#555; margin-top:6px;">
+                Confidence: <b>{confidence_label}</b> ({confidence_pct}%)
+            </div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-
-def build_monthly_cashflow(df):
-    monthly = (
-        df.assign(month_label=pd.to_datetime(df["date"], errors="coerce").dt.to_period("M").astype(str))
-        .groupby(["month_label", "type"], dropna=False)["amount"]
-        .sum()
-        .unstack(fill_value=0)
-        .reset_index()
-    )
-    for col in ["income", "expense"]:
-        if col not in monthly.columns:
-            monthly[col] = 0.0
-    monthly["net_cashflow"] = monthly["income"] - monthly["expense"]
-    return monthly
-
-
-def build_insights(df):
-    income_total = df.loc[df["type"] == "income", "amount"].sum()
-    expense_total = df.loc[df["type"] == "expense", "amount"].sum()
-    savings_rate = ((income_total - expense_total) / income_total * 100) if income_total > 0 else 0
-
-    recurring_expense = df.loc[(df["type"] == "expense") & (df["is_recurring"]), "amount"].sum()
-    recurring_burden = (recurring_expense / expense_total * 100) if expense_total > 0 else 0
-
-    anomaly_count = int(df["is_anomaly"].sum()) if "is_anomaly" in df.columns else 0
-    duplicate_count = int(df.attrs.get("duplicates_removed", 0))
-
-    expense_df = df[df["type"] == "expense"].copy()
-    biggest_category = "N/A"
-    highest_spend_month = "N/A"
-    top_merchants = []
-
-    if not expense_df.empty:
-        cat_spend = expense_df.groupby("category")["amount"].sum().sort_values(ascending=False)
-        biggest_category = cat_spend.index[0] if not cat_spend.empty else "N/A"
-
-        monthly = expense_df.groupby("month")["amount"].sum().sort_values(ascending=False)
-        highest_spend_month = monthly.index[0] if not monthly.empty else "N/A"
-
-        merchant_spend = expense_df.groupby("merchant_norm")["amount"].sum().sort_values(ascending=False)
-        top_merchants = merchant_spend.head(5).items()
-
-    return {
-        "income_total": income_total,
-        "expense_total": expense_total,
-        "savings_rate": savings_rate,
-        "recurring_burden": recurring_burden,
-        "biggest_category": biggest_category,
-        "highest_spend_month": highest_spend_month,
-        "top_merchants": top_merchants,
-        "anomaly_count": anomaly_count,
-        "duplicate_count": duplicate_count,
-    }
-
-
-def calculate_financial_health_score(df, budgets):
+def prepare_transactions_for_display(df):
+    df = safe_dataframe(df)
     if df.empty:
-        return 0, "No Data"
+        return df
+    display_cols = [
+        c for c in [
+            "date", "description", "normalized_merchant", "category", "amount",
+            "direction", "source", "transaction_id", "is_recurring",
+            "is_anomaly", "anomaly_reason", "parse_confidence"
+        ] if c in df.columns
+    ]
+    return df[display_cols].copy()
 
-    income_total = df.loc[df["type"] == "income", "amount"].sum()
-    expense_total = df.loc[df["type"] == "expense", "amount"].sum()
-    savings_rate = ((income_total - expense_total) / income_total * 100) if income_total > 0 else 0
+def prepare_rejected_for_display(df):
+    df = safe_dataframe(df)
+    if df.empty:
+        return df
+    cols = [c for c in ["source", "raw_text", "validation_reason", "parse_confidence"] if c in df.columns]
+    return df[cols].copy()
 
-    recurring_burden = 0
-    if expense_total > 0:
-        recurring_burden = (
-            df.loc[(df["type"] == "expense") & (df["is_recurring"]), "amount"].sum() / expense_total
-        ) * 100
-
-    anomaly_count = int(df["is_anomaly"].sum()) if "is_anomaly" in df.columns else 0
-    months = max(df["month"].nunique(), 1)
-    anomaly_rate = anomaly_count / months
-
-    budget_penalty = 0
-    expense_df = df[df["type"] == "expense"]
-    if not expense_df.empty:
-        actual_by_cat = expense_df.groupby("category")["amount"].sum().to_dict()
-        for cat, budget in budgets.items():
-            if budget > 0:
-                actual = actual_by_cat.get(cat, 0)
-                if actual > budget:
-                    overspend_pct = ((actual - budget) / budget) * 100
-                    budget_penalty += min(overspend_pct * 0.15, 8)
-
-    score = 100
-    score -= max(0, 25 - savings_rate) * 0.8
-    score -= max(0, recurring_burden - 35) * 0.5
-    score -= anomaly_rate * 8
-    score -= budget_penalty
-
-    score = max(0, min(100, round(score)))
-
-    if score >= 80:
-        label = "Excellent"
-    elif score >= 65:
-        label = "Good"
-    elif score >= 50:
-        label = "Average"
-    else:
-        label = "Needs Attention"
-
-    return score, label
+def prepare_duplicates_for_display(df):
+    df = safe_dataframe(df)
+    if df.empty:
+        return df
+    cols = [c for c in ["date", "description", "amount", "source", "duplicate_reason", "transaction_id"] if c in df.columns]
+    return df[cols].copy()
 
 
-def get_score_color(score):
-    if score >= 80:
-        return "#16a34a"
-    elif score >= 65:
-        return "#0284c7"
-    elif score >= 50:
-        return "#f59e0b"
-    return "#dc2626"
+# =========================================================
+# TITLE / INTRO
+# =========================================================
 
-
-def make_gauge(score, label):
-    color = get_score_color(score)
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=score,
-        number={"suffix": "/100"},
-        title={"text": f"Financial Health Score<br><span style='font-size:14px'>{label}</span>"},
-        gauge={
-            "axis": {"range": [0, 100]},
-            "bar": {"color": color},
-            "steps": [
-                {"range": [0, 50], "color": "#fee2e2"},
-                {"range": [50, 65], "color": "#fef3c7"},
-                {"range": [65, 80], "color": "#dbeafe"},
-                {"range": [80, 100], "color": "#dcfce7"},
-            ],
-        }
-    ))
-    fig.update_layout(height=300, margin=dict(l=20, r=20, t=50, b=20))
-    return fig
-
-
-st.markdown('<div class="main-title">Cognitive RPA for Personal Finance Data Consolidation</div>', unsafe_allow_html=True)
-st.markdown(
-    '<div class="sub-title">Unified pipeline for CSV, PDF, and text-based transaction data with learning, duplicate prevention, recurring detection, and anomaly insights.</div>',
-    unsafe_allow_html=True
+st.title("💰 Cognitive RPA for Personal Finance Data Consolidation")
+st.caption(
+    "Upload CSVs, bank PDFs, and SMS/email text. The system consolidates, cleans, deduplicates, "
+    "categorizes, detects recurring transactions, flags anomalies, tracks budgets, and computes a confidence-aware health score."
 )
 
-st.markdown("""
-<div class="hero-card">
-    <span class="badge">Cognitive RPA</span>
-    <span class="badge">Unified Pipeline</span>
-    <span class="badge">ML Anomaly Detection</span>
-    <span class="badge">Ask-Once Learning</span>
-    <span class="badge">Duplicate Prevention</span>
-    <div style="margin-top:10px;color:#0f172a;font-size:1rem;">
-        Upload CSV files, upload PDF statements, paste SMS/email text, and the app consolidates everything into one common transaction layer before analysis.
-    </div>
-</div>
-""", unsafe_allow_html=True)
+# =========================================================
+# SIDEBAR INPUTS
+# =========================================================
 
-# Sidebar
-with st.sidebar:
-    st.header("Settings")
-    consented = st.checkbox("I consent to process this financial data.", value=True)
+st.sidebar.header("Input Sources")
 
-    st.subheader("Budget Setup")
-    budgets = {
-        "Food": st.number_input("Food Budget", 0.0, value=10000.0, step=500.0),
-        "Travel": st.number_input("Travel Budget", 0.0, value=8000.0, step=500.0),
-        "Rent": st.number_input("Rent Budget", 0.0, value=20000.0, step=500.0),
-        "EMI/Loan": st.number_input("EMI/Loan Budget", 0.0, value=12000.0, step=500.0),
-        "Subscriptions": st.number_input("Subscriptions Budget", 0.0, value=2000.0, step=500.0),
-        "Shopping": st.number_input("Shopping Budget", 0.0, value=10000.0, step=500.0),
-        "Bills/Utilities": st.number_input("Bills/Utilities Budget", 0.0, value=6000.0, step=500.0),
-        "Investment": st.number_input("Investment Budget", 0.0, value=10000.0, step=500.0),
-        "Other": st.number_input("Other Budget", 0.0, value=5000.0, step=500.0),
-    }
+csv_files = st.sidebar.file_uploader(
+    "Upload CSV files",
+    type=["csv", "xlsx"],
+    accept_multiple_files=True
+)
 
-if not consented:
-    st.warning("Please provide consent to continue.")
+pdf_files = st.sidebar.file_uploader(
+    "Upload PDF statements",
+    type=["pdf"],
+    accept_multiple_files=True
+)
+
+text_input = st.sidebar.text_area(
+    "Paste SMS / email / raw transaction text",
+    height=180,
+    placeholder="Example:\n02/04/2026 UPI paid to Swiggy 340\n03/04/2026 Salary credited 45000"
+)
+
+st.sidebar.header("Budget Setup")
+
+budget_text = st.sidebar.text_area(
+    "Enter category budgets",
+    height=180,
+    placeholder="Groceries:5000\nFood & Dining:3000\nRent:15000\nTransport:2000"
+)
+
+budget_map = normalize_budget_input(budget_text)
+
+st.sidebar.header("Learning System")
+
+with st.sidebar.expander("Add merchant alias memory"):
+    alias_raw = st.text_input("Raw merchant text", key="alias_raw")
+    alias_norm = st.text_input("Normalized merchant name", key="alias_norm")
+    if st.button("Save merchant alias"):
+        if alias_raw and alias_norm:
+            remember_merchant_alias(alias_raw, alias_norm)
+            st.success("Merchant alias saved.")
+        else:
+            st.warning("Enter both raw and normalized merchant values.")
+
+with st.sidebar.expander("Add merchant category memory"):
+    mem_merchant = st.text_input("Merchant / normalized merchant", key="mem_merchant")
+    mem_category = st.text_input("Category", key="mem_category")
+    if st.button("Save merchant category"):
+        if mem_merchant and mem_category:
+            remember_category(mem_merchant, mem_category)
+            st.success("Merchant category saved.")
+        else:
+            st.warning("Enter both merchant and category.")
+
+run_btn = st.sidebar.button("Run Analysis", type="primary", use_container_width=True)
+
+# =========================================================
+# MAIN PIPELINE
+# =========================================================
+
+result = None
+
+if run_btn:
+    with st.spinner("Processing and analyzing transactions..."):
+        result = process_financial_data(
+            csv_files=csv_files,
+            pdf_files=pdf_files,
+            text_inputs=[text_input] if text_input.strip() else [],
+            budget_map=budget_map,
+        )
+    st.session_state["result"] = result
+
+if "result" in st.session_state:
+    result = st.session_state["result"]
+
+if not result:
+    show_empty_state()
     st.stop()
 
-# Input section
-with st.expander("Upload / Paste Financial Data", expanded=True):
-    col1, col2 = st.columns(2)
+transactions = safe_dataframe(result.get("transactions"))
+budget_df = safe_dataframe(result.get("budget_tracking"))
+rejected_df = safe_dataframe(result.get("rejected_rows"))
+duplicate_df = safe_dataframe(result.get("duplicate_rows"))
+health = result.get("health", {})
+insights = result.get("insights", [])
+quality = result.get("data_quality_summary", {})
 
-    with col1:
-        csv_files = st.file_uploader("Upload CSV files", type=["csv"], accept_multiple_files=True)
-        pdf_files = st.file_uploader("Upload PDF files", type=["pdf"], accept_multiple_files=True)
+# =========================================================
+# TOP SUMMARY
+# =========================================================
 
-    with col2:
-        sample_text = """01/01/2024 Salary credited INR 55000 txn id SALJAN24
-03/01/2024 Rent paid INR 18000 txn id RENTJAN24
-05/01/2024 Netflix subscription debited INR 649 txn id NFXJAN24
-08/01/2024 Swiggy order paid INR 420 txn id SWG080124
-15/01/2024 Amazon purchase debited INR 3499 txn id AMZ150124
-20/01/2024 Electricity bill paid INR 2200 txn id ELE200124"""
-        text_input = st.text_area("Paste SMS / email-style text", value=sample_text, height=220)
+score = health.get("health_score", 0)
+score_band = health.get("score_band", "Unknown")
+confidence_label = health.get("confidence_label", "Low")
+confidence_pct = health.get("quality_confidence", 0)
 
-dfs = []
+col_a, col_b = st.columns([1.1, 2])
 
-if csv_files:
-    for file in csv_files:
-        try:
-            dfs.append(load_csv(file))
-        except Exception as e:
-            st.error(f"CSV error in {file.name}: {e}")
+with col_a:
+    render_health_badge(score, score_band, confidence_label, confidence_pct)
 
-if pdf_files:
-    for file in pdf_files:
-        try:
-            dfs.append(extract_from_pdf(file))
-        except Exception as e:
-            st.error(f"PDF error in {file.name}: {e}")
+with col_b:
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        metric_card("Valid Transactions", len(transactions))
+    with c2:
+        metric_card("Rejected Rows", int(quality.get("rejected_rows", len(rejected_df))))
+    with c3:
+        metric_card("Duplicates Removed", int(quality.get("duplicates_removed", len(duplicate_df))))
+    with c4:
+        metric_card("Acceptance Rate", f"{quality.get('acceptance_rate_pct', 0)}%")
 
-if text_input.strip():
-    try:
-        text_df = extract_from_text(text_input)
-        if not text_df.empty:
-            dfs.append(text_df)
-    except Exception as e:
-        st.error(f"Text parsing error: {e}")
+    st.markdown("### Key Insights")
+    if insights:
+        for insight in insights[:5]:
+            st.write(f"• {insight}")
+    else:
+        st.write("No insights generated yet.")
 
-combined_raw_df = combine_sources(dfs)
-
-if combined_raw_df.empty:
-    st.info("No valid transactions found yet. Upload or paste data.")
-    st.stop()
-
-df = enrich_transactions(combined_raw_df, MEMORY_FILE)
-duplicates_removed = int(df.attrs.get("duplicates_removed", 0))
-memory_df = load_memory(MEMORY_FILE)
-uncertain_df = get_uncertain_transactions(df, memory_df)
-
-# KPIs
-insights = build_insights(df)
-score, score_label = calculate_financial_health_score(df, budgets)
-
-income_total = insights["income_total"]
-expense_total = insights["expense_total"]
-net_cashflow = income_total - expense_total
-anomaly_count = insights["anomaly_count"]
-recurring_count = int(df["is_recurring"].sum()) if "is_recurring" in df.columns else 0
-
-m1, m2, m3, m4, m5, m6 = st.columns(6)
-with m1:
-    metric_card("Income", format_inr(income_total))
-with m2:
-    metric_card("Expense", format_inr(expense_total))
-with m3:
-    metric_card("Net Cashflow", format_inr(net_cashflow))
-with m4:
-    metric_card("Health Score", f"{score}/100")
-with m5:
-    metric_card("Anomalies", str(anomaly_count))
-with m6:
-    metric_card("Duplicates Removed", str(duplicates_removed))
+# =========================================================
+# TABS
+# =========================================================
 
 tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "Overview", "Budget", "Anomalies", "Recurring", "Learning", "Raw Data"
+    "Overview",
+    "Transactions",
+    "Analytics",
+    "Budget & Health",
+    "Quality & Audit Trail",
+    "Learning Memory",
 ])
 
-expense_df = df[df["type"] == "expense"].copy()
-monthly_cashflow = build_monthly_cashflow(df)
+# =========================================================
+# TAB 1 - OVERVIEW
+# =========================================================
 
 with tab1:
-    c1, c2 = st.columns(2)
+    st.subheader("Overview Dashboard")
 
-    with c1:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Spend by Category")
-        if not expense_df.empty:
-            spend_by_category = (
-                expense_df.groupby("category", as_index=False)["amount"]
-                .sum()
-                .sort_values("amount", ascending=False)
-            )
-            fig_cat = px.pie(
-                spend_by_category,
-                names="category",
-                values="amount",
-                hole=0.55
-            )
-            fig_cat.update_layout(height=400, margin=dict(l=10, r=10, t=40, b=10))
-            st.plotly_chart(fig_cat, use_container_width=True)
-        else:
-            st.info("No expense transactions available.")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with c2:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.plotly_chart(make_gauge(score, score_label), use_container_width=True)
-        st.markdown(
-            "<div class='small-note'>Score is based on savings rate, recurring burden, anomaly frequency, and budget discipline.</div>",
-            unsafe_allow_html=True
-        )
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    c3, c4 = st.columns(2)
-
-    with c3:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Monthly Cashflow")
-        fig_month = px.bar(monthly_cashflow, x="month_label", y="net_cashflow")
-        fig_month.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig_month, use_container_width=True)
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    with c4:
-        st.markdown('<div class="section-card">', unsafe_allow_html=True)
-        st.subheader("Key Insights")
-        st.markdown(f"- **Savings rate:** {insights['savings_rate']:.1f}%")
-        st.markdown(f"- **Recurring burden:** {insights['recurring_burden']:.1f}% of expense")
-        st.markdown(f"- **Biggest spend category:** {insights['biggest_category']}")
-        st.markdown(f"- **Highest spend month:** {insights['highest_spend_month']}")
-        st.markdown(f"- **Sources processed:** {', '.join(sorted(df['source'].dropna().unique().tolist()))}")
-
-        if insights["top_merchants"]:
-            merchant_text = ", ".join([f"{m} ({format_inr(v)})" for m, v in insights["top_merchants"]])
-            st.markdown(f"- **Top merchants:** {merchant_text}")
-        else:
-            st.markdown("- **Top merchants:** N/A")
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.subheader("Smart Alerts")
-
-    alerts = []
-
-    if insights["recurring_burden"] > 40:
-        alerts.append(f"Recurring expenses are high at {insights['recurring_burden']:.1f}% of total spending.")
-
-    negative_months = monthly_cashflow[monthly_cashflow["net_cashflow"] < 0]["month_label"].tolist()
-    if negative_months:
-        alerts.append("Negative cashflow months detected: " + ", ".join(negative_months))
-
-    if not expense_df.empty:
-        large_threshold = expense_df["amount"].quantile(0.95)
-        large_expense_count = int((expense_df["amount"] >= large_threshold).sum())
-        if large_expense_count > 0:
-            alerts.append(f"{large_expense_count} large expense transaction(s) detected above the 95th percentile.")
-
-    if anomaly_count > 0:
-        alerts.append(f"ML anomaly layer flagged {anomaly_count} unusual transaction(s).")
-
-    if duplicates_removed > 0:
-        alerts.append(f"Duplicate prevention removed {duplicates_removed} transaction(s) to avoid double counting across sources.")
-
-    if alerts:
-        for alert in alerts:
-            st.warning(alert)
+    if transactions.empty:
+        st.warning("No valid transactions available after validation.")
     else:
-        st.success("No major alerts detected.")
-    st.markdown('</div>', unsafe_allow_html=True)
+        tx = transactions.copy()
+        tx["date"] = pd.to_datetime(tx["date"], errors="coerce")
+
+        row1_col1, row1_col2 = st.columns(2)
+
+        with row1_col1:
+            if "direction" in tx.columns:
+                dir_summary = tx.groupby("direction")["amount"].sum().reset_index()
+                if not dir_summary.empty:
+                    fig = px.pie(
+                        dir_summary,
+                        names="direction",
+                        values="amount",
+                        title="Income vs Expense Distribution"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+        with row1_col2:
+            if "category" in tx.columns:
+                cat_summary = tx.groupby("category")["amount"].sum().reset_index().sort_values("amount", ascending=False)
+                if not cat_summary.empty:
+                    fig = px.bar(
+                        cat_summary.head(10),
+                        x="category",
+                        y="amount",
+                        title="Top Spending Categories"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+        row2_col1, row2_col2 = st.columns(2)
+
+        with row2_col1:
+            if "normalized_merchant" in tx.columns:
+                merch_summary = tx.groupby("normalized_merchant")["amount"].sum().reset_index().sort_values("amount", ascending=False)
+                if not merch_summary.empty:
+                    fig = px.bar(
+                        merch_summary.head(10),
+                        x="normalized_merchant",
+                        y="amount",
+                        title="Top Merchants by Amount"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+        with row2_col2:
+            if "date" in tx.columns:
+                trend = tx.groupby("date")["amount"].sum().reset_index().sort_values("date")
+                if not trend.empty:
+                    fig = px.line(
+                        trend,
+                        x="date",
+                        y="amount",
+                        title="Transaction Amount Trend"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+# =========================================================
+# TAB 2 - TRANSACTIONS
+# =========================================================
 
 with tab2:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.subheader("Budget Tracking")
+    st.subheader("Transaction Explorer")
 
-    if not expense_df.empty:
-        actual_by_cat = expense_df.groupby("category")["amount"].sum().to_dict()
-        budget_rows = []
-
-        for cat, budget in budgets.items():
-            actual = actual_by_cat.get(cat, 0.0)
-            variance = actual - budget
-            status = "Over Budget" if variance > 0 else "Within Budget"
-            budget_rows.append({
-                "category": cat,
-                "budget": budget,
-                "actual": actual,
-                "variance": variance,
-                "status": status
-            })
-
-        budget_df = pd.DataFrame(budget_rows)
-        st.dataframe(budget_df, use_container_width=True)
-
-        fig_budget = px.bar(
-            budget_df,
-            x="category",
-            y=["budget", "actual"],
-            barmode="group"
-        )
-        fig_budget.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
-        st.plotly_chart(fig_budget, use_container_width=True)
+    if transactions.empty:
+        st.warning("No valid transactions found.")
     else:
-        st.info("No expense transactions available for budget tracking.")
-    st.markdown('</div>', unsafe_allow_html=True)
+        tx = transactions.copy()
+
+        f1, f2, f3 = st.columns(3)
+
+        with f1:
+            source_filter = st.multiselect(
+                "Filter by source",
+                options=sorted(tx["source"].dropna().astype(str).unique().tolist()) if "source" in tx.columns else [],
+                default=sorted(tx["source"].dropna().astype(str).unique().tolist()) if "source" in tx.columns else []
+            )
+
+        with f2:
+            direction_filter = st.multiselect(
+                "Filter by direction",
+                options=sorted(tx["direction"].dropna().astype(str).unique().tolist()) if "direction" in tx.columns else [],
+                default=sorted(tx["direction"].dropna().astype(str).unique().tolist()) if "direction" in tx.columns else []
+            )
+
+        with f3:
+            category_filter = st.multiselect(
+                "Filter by category",
+                options=sorted(tx["category"].dropna().astype(str).unique().tolist()) if "category" in tx.columns else [],
+                default=[]
+            )
+
+        search_text = st.text_input("Search description / merchant")
+
+        if source_filter and "source" in tx.columns:
+            tx = tx[tx["source"].astype(str).isin(source_filter)]
+
+        if direction_filter and "direction" in tx.columns:
+            tx = tx[tx["direction"].astype(str).isin(direction_filter)]
+
+        if category_filter and "category" in tx.columns:
+            tx = tx[tx["category"].astype(str).isin(category_filter)]
+
+        if search_text:
+            search_lower = search_text.lower()
+            tx = tx[
+                tx["description"].astype(str).str.lower().str.contains(search_lower, na=False) |
+                tx["normalized_merchant"].astype(str).str.lower().str.contains(search_lower, na=False)
+            ]
+
+        st.dataframe(prepare_transactions_for_display(tx), use_container_width=True, height=450)
+
+        csv_data = make_download_csv(tx)
+        if csv_data:
+            st.download_button(
+                "Download filtered transactions CSV",
+                data=csv_data,
+                file_name="filtered_transactions.csv",
+                mime="text/csv"
+            )
+
+# =========================================================
+# TAB 3 - ANALYTICS
+# =========================================================
 
 with tab3:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.subheader("Unusual Spending Detected by ML")
-    anomaly_view = df[df["is_anomaly"]].copy().sort_values("amount", ascending=False)
+    st.subheader("Analytical View")
 
-    if anomaly_view.empty:
-        st.info("No anomalies detected.")
+    if transactions.empty:
+        st.warning("No valid transactions available for analysis.")
     else:
-        anomaly_view["date"] = pd.to_datetime(anomaly_view["date"], errors="coerce").dt.date
-        st.dataframe(
-            anomaly_view[["date", "merchant_norm", "category", "source", "amount", "anomaly_reason", "description"]],
-            use_container_width=True
-        )
-    st.markdown('</div>', unsafe_allow_html=True)
+        tx = transactions.copy()
+
+        a1, a2 = st.columns(2)
+
+        with a1:
+            recurring_df = tx[tx["is_recurring"] == True] if "is_recurring" in tx.columns else pd.DataFrame()
+            st.markdown("#### Recurring Transactions")
+            if recurring_df.empty:
+                st.info("No recurring transaction patterns detected.")
+            else:
+                rec_summary = recurring_df.groupby(["normalized_merchant", "category"], as_index=False)["amount"].agg(["count", "mean"]).reset_index()
+                rec_summary.columns = ["normalized_merchant", "category", "count", "average_amount"]
+                st.dataframe(rec_summary, use_container_width=True, height=250)
+
+        with a2:
+            anomaly_df = tx[tx["is_anomaly"] == True] if "is_anomaly" in tx.columns else pd.DataFrame()
+            st.markdown("#### Anomaly Detection")
+            if anomaly_df.empty:
+                st.info("No anomalies detected.")
+            else:
+                show_cols = [c for c in ["date", "description", "normalized_merchant", "category", "amount", "anomaly_reason"] if c in anomaly_df.columns]
+                st.dataframe(anomaly_df[show_cols], use_container_width=True, height=250)
+
+        st.markdown("#### Source Mix")
+        if "source" in tx.columns:
+            source_summary = tx["source"].value_counts().reset_index()
+            source_summary.columns = ["source", "count"]
+            fig = px.bar(source_summary, x="source", y="count", title="Accepted Transactions by Source")
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("#### Category Deep Dive")
+        if "category" in tx.columns:
+            cat_summary = tx.groupby("category", as_index=False)["amount"].sum().sort_values("amount", ascending=False)
+            fig = px.treemap(
+                cat_summary,
+                path=["category"],
+                values="amount",
+                title="Category Distribution"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+# =========================================================
+# TAB 4 - BUDGET & HEALTH
+# =========================================================
 
 with tab4:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.subheader("Recurring Transactions")
-    recurring_view = df[df["is_recurring"]].copy().sort_values(["merchant_norm", "date"])
+    st.subheader("Budget and Financial Health")
 
-    if recurring_view.empty:
-        st.info("No recurring transactions detected.")
+    h1, h2, h3, h4 = st.columns(4)
+    with h1:
+        metric_card("Health Score", f"{health.get('health_score', 0)}/100")
+    with h2:
+        metric_card("Score Band", health.get("score_band", "Unknown"))
+    with h3:
+        metric_card("Confidence", health.get("confidence_label", "Low"))
+    with h4:
+        metric_card("Confidence %", f"{health.get('quality_confidence', 0)}%")
+
+    st.markdown("#### Health Score Components")
+    components = health.get("components", {})
+    if components:
+        comp_df = pd.DataFrame({
+            "Component": list(components.keys()),
+            "Value": list(components.values())
+        })
+        st.dataframe(comp_df, use_container_width=True, height=300)
+
+    st.markdown("#### Budget Tracking")
+    if budget_df.empty:
+        st.info("No budget output available. Add budget inputs in the sidebar.")
     else:
-        recurring_view["date"] = pd.to_datetime(recurring_view["date"], errors="coerce").dt.date
-        st.dataframe(
-            recurring_view[["date", "merchant_norm", "category", "source", "amount", "description"]],
-            use_container_width=True
-        )
-    st.markdown('</div>', unsafe_allow_html=True)
+        st.dataframe(budget_df, use_container_width=True, height=300)
+
+        if "category" in budget_df.columns and "spent" in budget_df.columns:
+            fig = px.bar(
+                budget_df.sort_values("spent", ascending=False),
+                x="category",
+                y="spent",
+                title="Budget Spend by Category"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+# =========================================================
+# TAB 5 - QUALITY & AUDIT TRAIL
+# =========================================================
 
 with tab5:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.subheader("Ask-Once Learning")
-    st.caption("If the system is unsure, you correct it once. The app remembers it for future transactions.")
+    st.subheader("Data Quality and Audit Trail")
 
-    if uncertain_df.empty:
-        st.success("No new merchant learning required.")
-    else:
-        for _, row in uncertain_df.iterrows():
-            merchant = row["merchant_norm"]
-            st.write(f"Merchant: {merchant} | Current guess: {row['category']}")
+    q1, q2, q3, q4 = st.columns(4)
+    with q1:
+        metric_card("Parsed Rows", quality.get("total_parsed_rows", 0))
+    with q2:
+        metric_card("Accepted", quality.get("valid_rows_accepted", 0))
+    with q3:
+        metric_card("Rejected", quality.get("rejected_rows", 0))
+    with q4:
+        metric_card("Avg Confidence", f"{quality.get('average_valid_confidence_pct', 0)}%")
 
-            c1, c2, c3 = st.columns([2, 2, 1])
-            with c1:
-                selected_category = st.selectbox(
-                    f"Category for {merchant}",
-                    options=CATEGORIES,
-                    index=CATEGORIES.index("Other"),
-                    key=f"cat_{merchant}"
+    st.markdown("#### Quality Summary")
+    st.json(quality)
+
+    subtab1, subtab2 = st.tabs(["Rejected Rows", "Duplicate Rows"])
+
+    with subtab1:
+        if rejected_df.empty:
+            st.success("No rejected rows.")
+        else:
+            st.dataframe(prepare_rejected_for_display(rejected_df), use_container_width=True, height=350)
+            rejected_csv = make_download_csv(rejected_df)
+            if rejected_csv:
+                st.download_button(
+                    "Download rejected rows CSV",
+                    data=rejected_csv,
+                    file_name="rejected_rows.csv",
+                    mime="text/csv"
                 )
-            with c2:
-                selected_type = st.selectbox(
-                    f"Type for {merchant}",
-                    options=["expense", "income"],
-                    index=0 if row["type"] == "expense" else 1,
-                    key=f"type_{merchant}"
+
+    with subtab2:
+        if duplicate_df.empty:
+            st.success("No duplicate rows detected.")
+        else:
+            st.dataframe(prepare_duplicates_for_display(duplicate_df), use_container_width=True, height=350)
+            duplicate_csv = make_download_csv(duplicate_df)
+            if duplicate_csv:
+                st.download_button(
+                    "Download duplicate rows CSV",
+                    data=duplicate_csv,
+                    file_name="duplicate_rows.csv",
+                    mime="text/csv"
                 )
-            with c3:
-                st.write("")
-                st.write("")
-                if st.button(f"Save {merchant}", key=f"save_{merchant}"):
-                    save_memory_entry(merchant, selected_category, selected_type, MEMORY_FILE)
-                    st.success(f"Saved learning for {merchant}. Re-run the app.")
-    st.markdown('</div>', unsafe_allow_html=True)
+
+# =========================================================
+# TAB 6 - LEARNING MEMORY
+# =========================================================
 
 with tab6:
-    st.markdown('<div class="section-card">', unsafe_allow_html=True)
-    st.subheader("Unified Raw Data")
-    raw_view = df.copy()
-    raw_view["date"] = pd.to_datetime(raw_view["date"], errors="coerce").dt.date
-    st.dataframe(raw_view, use_container_width=True)
+    st.subheader("Learning Memory")
 
-    csv_data = df.copy()
-    csv_data["date"] = pd.to_datetime(csv_data["date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    st.download_button(
-        "Download Processed CSV",
-        data=csv_data.to_csv(index=False).encode("utf-8"),
-        file_name="processed_finance_transactions.csv",
-        mime="text/csv",
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
+    memory = load_learning_memory()
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("#### Merchant Category Memory")
+        merchant_category_map = memory.get("merchant_category_map", {})
+        if merchant_category_map:
+            mem_df = pd.DataFrame({
+                "merchant": list(merchant_category_map.keys()),
+                "category": list(merchant_category_map.values())
+            })
+            st.dataframe(mem_df, use_container_width=True, height=300)
+        else:
+            st.info("No merchant-category memory saved yet.")
+
+    with right:
+        st.markdown("#### Merchant Normalization Memory")
+        merchant_normalization_map = memory.get("merchant_normalization_map", {})
+        if merchant_normalization_map:
+            alias_df = pd.DataFrame({
+                "raw_merchant": list(merchant_normalization_map.keys()),
+                "normalized_merchant": list(merchant_normalization_map.values())
+            })
+            st.dataframe(alias_df, use_container_width=True, height=300)
+        else:
+            st.info("No merchant alias memory saved yet.")
+
+    st.markdown("#### Memory JSON Preview")
+    st.code(json.dumps(memory, indent=2), language="json")
