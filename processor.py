@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Optional
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
@@ -61,11 +61,30 @@ MERCHANT_PATTERNS = [
 ]
 
 STANDARD_COLUMNS = [
-    "transaction_id", "date", "amount", "description", "type",
-    "category", "merchant_norm", "month", "day"
+    "transaction_id",
+    "date",
+    "amount",
+    "description",
+    "type",
+    "category",
+    "merchant_norm",
+    "source",
+    "month",
+    "day",
 ]
 
 MEMORY_FILE = "user_memory.csv"
+
+DATE_REGEX = re.compile(
+    r"(\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b)",
+    flags=re.IGNORECASE,
+)
+
+AMOUNT_REGEX = re.compile(r"(?:₹|INR|Rs\.?\s*)?\s*-?\d[\d,]*(?:\.\d{1,2})?", flags=re.IGNORECASE)
+
+TRANSACTION_ID_REGEX = re.compile(
+    r"(?i)(?:txn(?:action)?\s*id|txn\s*ref|utr|ref(?:erence)?\s*no|txn\s*no)[:\s\-]*([A-Za-z0-9\-_\/]+)"
+)
 
 
 def ensure_memory_file(memory_file: str = MEMORY_FILE):
@@ -126,6 +145,7 @@ def normalize_amount(x) -> Optional[float]:
     s = s.replace(",", "")
     s = re.sub(r"(?i)inr|rs\.?|₹|mrp", "", s)
     s = re.sub(r"(?i)cr|dr", "", s)
+
     match = re.search(r"-?\d+(?:\.\d+)?", s)
     if not match:
         return np.nan
@@ -190,12 +210,14 @@ def normalize_merchant(description: str) -> str:
 
 def categorize(description: str, tx_type: Optional[str] = None) -> str:
     text = str(description).lower()
+
     if tx_type == "income" or any(k in text for k in ["salary", "credited", "refund", "bonus", "interest"]):
         return "Income"
 
     for category, keywords in CATEGORY_KEYWORDS.items():
         if any(k in text for k in keywords):
             return category
+
     return "Other"
 
 
@@ -217,56 +239,11 @@ def _infer_type_from_row(row) -> str:
             return "expense"
         if amount > 0 and any(k in desc.lower() for k in INCOME_KEYWORDS):
             return "income"
+
     return guess_type_from_text(desc)
 
 
-def _standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
-    df = raw_df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
-
-    date_col = _find_column(df.columns, ["date", "txn date", "transaction date", "posted date", "value date"])
-    desc_col = _find_column(df.columns, ["description", "narration", "details", "remarks", "merchant", "transaction"])
-    amount_col = _find_column(df.columns, ["amount", "amt"])
-    type_col = _find_column(df.columns, ["type", "dr/cr", "transaction type", "nature"])
-    credit_col = _find_column(df.columns, ["credit", "deposit"])
-    debit_col = _find_column(df.columns, ["debit", "withdrawal", "spent"])
-    transaction_id_col = _find_column(df.columns, ["transaction id", "txn id", "transactionid", "txn_ref", "reference", "utr", "ref no", "txn no", "id"])
-
-    standardized = pd.DataFrame()
-
-    standardized["transaction_id"] = df[transaction_id_col].astype(str).str.strip() if transaction_id_col else ""
-    standardized["date"] = df[date_col].apply(parse_date) if date_col else pd.NaT
-
-    if amount_col:
-        standardized["amount_raw"] = df[amount_col].apply(normalize_amount)
-    elif credit_col or debit_col:
-        credit_vals = df[credit_col].apply(normalize_amount) if credit_col else pd.Series(np.nan, index=df.index)
-        debit_vals = df[debit_col].apply(normalize_amount) if debit_col else pd.Series(np.nan, index=df.index)
-        standardized["amount_raw"] = credit_vals.fillna(0) - debit_vals.fillna(0)
-    else:
-        numeric_like_cols = [c for c in df.columns if df[c].astype(str).str.contains(r"\d", regex=True, na=False).mean() > 0.8]
-        if numeric_like_cols:
-            standardized["amount_raw"] = df[numeric_like_cols[-1]].apply(normalize_amount)
-        else:
-            standardized["amount_raw"] = np.nan
-
-    if desc_col:
-        standardized["description"] = df[desc_col].astype(str)
-    else:
-        text_cols = [c for c in df.columns if c not in {date_col, amount_col, type_col, credit_col, debit_col, transaction_id_col}]
-        standardized["description"] = df[text_cols].astype(str).agg(" | ".join, axis=1) if text_cols else "Transaction"
-
-    if type_col:
-        standardized["type"] = df[type_col].astype(str).str.lower().map(
-            lambda x: "income" if any(k in x for k in ["cr", "credit", "income"]) else "expense"
-        )
-    else:
-        standardized["type"] = standardized.apply(_infer_type_from_row, axis=1)
-
-    return _finalize_transactions(standardized)
-
-
-def _finalize_transactions(df: pd.DataFrame) -> pd.DataFrame:
+def _finalize_transactions(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
     out = df.copy()
 
     if "transaction_id" not in out.columns:
@@ -295,6 +272,7 @@ def _finalize_transactions(df: pd.DataFrame) -> pd.DataFrame:
     out["description"] = out["description"].apply(clean_description_context)
     out["merchant_norm"] = out["description"].apply(normalize_merchant)
     out["category"] = out.apply(lambda r: categorize(r["description"], r["type"]), axis=1)
+    out["source"] = source_name
     out["month"] = out["date"].dt.to_period("M").astype(str)
     out["day"] = out["date"].dt.day
 
@@ -302,8 +280,59 @@ def _finalize_transactions(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["amount"] > 0].copy()
     out = out.sort_values("date", ascending=True, na_position="last").reset_index(drop=True)
 
-    final_cols = [c for c in STANDARD_COLUMNS if c in out.columns]
-    return out[final_cols]
+    return out[STANDARD_COLUMNS]
+
+
+def _standardize_dataframe(raw_df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    df = raw_df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    date_col = _find_column(df.columns, ["date", "txn date", "transaction date", "posted date", "value date"])
+    desc_col = _find_column(df.columns, ["description", "narration", "details", "remarks", "merchant", "transaction"])
+    amount_col = _find_column(df.columns, ["amount", "amt"])
+    type_col = _find_column(df.columns, ["type", "dr/cr", "transaction type", "nature"])
+    credit_col = _find_column(df.columns, ["credit", "deposit"])
+    debit_col = _find_column(df.columns, ["debit", "withdrawal", "spent"])
+    transaction_id_col = _find_column(
+        df.columns,
+        ["transaction id", "txn id", "transactionid", "txn_ref", "reference", "utr", "ref no", "txn no", "id"]
+    )
+
+    standardized = pd.DataFrame()
+
+    standardized["transaction_id"] = df[transaction_id_col].astype(str).str.strip() if transaction_id_col else ""
+    standardized["date"] = df[date_col].apply(parse_date) if date_col else pd.NaT
+
+    if amount_col:
+        standardized["amount_raw"] = df[amount_col].apply(normalize_amount)
+    elif credit_col or debit_col:
+        credit_vals = df[credit_col].apply(normalize_amount) if credit_col else pd.Series(np.nan, index=df.index)
+        debit_vals = df[debit_col].apply(normalize_amount) if debit_col else pd.Series(np.nan, index=df.index)
+        standardized["amount_raw"] = credit_vals.fillna(0) - debit_vals.fillna(0)
+    else:
+        numeric_like_cols = [
+            c for c in df.columns
+            if df[c].astype(str).str.contains(r"\d", regex=True, na=False).mean() > 0.8
+        ]
+        if numeric_like_cols:
+            standardized["amount_raw"] = df[numeric_like_cols[-1]].apply(normalize_amount)
+        else:
+            standardized["amount_raw"] = np.nan
+
+    if desc_col:
+        standardized["description"] = df[desc_col].astype(str)
+    else:
+        text_cols = [c for c in df.columns if c not in {date_col, amount_col, type_col, credit_col, debit_col, transaction_id_col}]
+        standardized["description"] = df[text_cols].astype(str).agg(" | ".join, axis=1) if text_cols else "Transaction"
+
+    if type_col:
+        standardized["type"] = df[type_col].astype(str).str.lower().map(
+            lambda x: "income" if any(k in x for k in ["cr", "credit", "income"]) else "expense"
+        )
+    else:
+        standardized["type"] = standardized.apply(_infer_type_from_row, axis=1)
+
+    return _finalize_transactions(standardized, source_name=source_name)
 
 
 def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
@@ -328,135 +357,6 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.concat([with_id, without_id], ignore_index=True)
     out = out.sort_values("date", ascending=True, na_position="last").reset_index(drop=True)
     return out
-
-
-DATE_REGEX = re.compile(
-    r"(\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b)",
-    flags=re.IGNORECASE,
-)
-
-AMOUNT_REGEX = re.compile(r"(?:₹|INR|Rs\.?\s*)?\s*-?\d[\d,]*(?:\.\d{1,2})?", flags=re.IGNORECASE)
-
-TRANSACTION_ID_REGEX = re.compile(
-    r"(?i)(?:txn(?:action)?\s*id|txn\s*ref|utr|ref(?:erence)?\s*no|txn\s*no)[:\s\-]*([A-Za-z0-9\-_\/]+)"
-)
-
-
-def _parse_line_to_transaction(line: str):
-    if not line or not line.strip():
-        return None
-
-    date_match = DATE_REGEX.search(line)
-    amount_matches = AMOUNT_REGEX.findall(line)
-    if not date_match or not amount_matches:
-        return None
-
-    date_text = date_match.group(0)
-    amount_text = amount_matches[-1]
-    amount = normalize_amount(amount_text)
-    if pd.isna(amount):
-        return None
-
-    tx_type = guess_type_from_text(line)
-    description = clean_description_context(line)
-
-    txn_match = TRANSACTION_ID_REGEX.search(line)
-    txn_id = txn_match.group(1).strip() if txn_match else ""
-
-    return {
-        "transaction_id": txn_id,
-        "date": parse_date(date_text),
-        "amount_raw": amount if tx_type == "income" else -abs(amount),
-        "description": description,
-        "type": tx_type,
-    }
-
-
-def extract_from_text(text: str) -> pd.DataFrame:
-    rows = []
-    for raw_line in str(text).splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        row = _parse_line_to_transaction(line)
-        if row:
-            rows.append(row)
-
-    return _finalize_transactions(pd.DataFrame(rows)) if rows else pd.DataFrame(columns=STANDARD_COLUMNS)
-
-
-def _extract_pdf_text(file) -> str:
-    if pdfplumber is None:
-        return ""
-
-    text_parts = []
-    file.seek(0)
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text() or ""
-            text_parts.append(page_text)
-    file.seek(0)
-    return "\n".join(text_parts)
-
-
-def _extract_pdf_tables(file):
-    if pdfplumber is None:
-        return []
-
-    tables = []
-    file.seek(0)
-    with pdfplumber.open(file) as pdf:
-        for page in pdf.pages:
-            page_tables = page.extract_tables() or []
-            for table in page_tables:
-                if not table or len(table) < 2:
-                    continue
-                header = [str(h).strip() if h is not None else "" for h in table[0]]
-                body = table[1:]
-                try:
-                    temp_df = pd.DataFrame(body, columns=header)
-                except Exception:
-                    continue
-                tables.append(temp_df)
-    file.seek(0)
-    return tables
-
-
-def _parse_transactions_from_blob(text_blob: str) -> pd.DataFrame:
-    rows = []
-    for raw_line in str(text_blob).splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        row = _parse_line_to_transaction(line)
-        if row:
-            rows.append(row)
-
-    return _finalize_transactions(pd.DataFrame(rows)) if rows else pd.DataFrame(columns=STANDARD_COLUMNS)
-
-
-def extract_from_pdf(file) -> pd.DataFrame:
-    all_rows = []
-    for table_df in _extract_pdf_tables(file):
-        try:
-            standardized = _standardize_dataframe(table_df)
-            if not standardized.empty:
-                all_rows.append(standardized)
-        except Exception:
-            continue
-
-    if all_rows:
-        combined = pd.concat(all_rows, ignore_index=True)
-        combined = combined.drop_duplicates().reset_index(drop=True)
-        return combined
-
-    text_blob = _extract_pdf_text(file)
-    return _parse_transactions_from_blob(text_blob)
-
-
-def load_csv(file) -> pd.DataFrame:
-    df = pd.read_csv(file)
-    return _standardize_dataframe(df)
 
 
 def apply_memory_learning(df: pd.DataFrame, memory_df: pd.DataFrame) -> pd.DataFrame:
@@ -523,12 +423,16 @@ def detect_recurring(df: pd.DataFrame) -> pd.DataFrame:
     )
     stats["amount_std"] = stats["amount_std"].fillna(0)
     stats["cv"] = stats["amount_std"] / stats["amount_mean"].replace(0, np.nan)
+
     recurring_merchants = stats[
-        (stats["month_count"] >= 2) &
-        ((stats["cv"] <= 0.20) | (stats["tx_count"] >= 3))
+        (stats["month_count"] >= 2) & ((stats["cv"] <= 0.20) | (stats["tx_count"] >= 3))
     ]["merchant_norm"].tolist()
 
-    out.loc[out["merchant_norm"].isin(recurring_merchants) & (out["type"] == "expense"), "is_recurring"] = True
+    out.loc[
+        out["merchant_norm"].isin(recurring_merchants) & (out["type"] == "expense"),
+        "is_recurring"
+    ] = True
+
     return out
 
 
@@ -562,7 +466,6 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     if expense_df.empty:
         return out
 
-    # Safe fallback if sklearn is unavailable or dataset is too small
     if IsolationForest is None or len(expense_df) < 5:
         threshold = expense_df["amount"].quantile(0.90)
         flagged = expense_df[expense_df["amount"] >= threshold].index
@@ -603,11 +506,147 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def load_csv(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
+    return _standardize_dataframe(df, source_name="csv")
+
+
+def _parse_line_to_transaction(line: str):
+    if not line or not line.strip():
+        return None
+
+    date_match = DATE_REGEX.search(line)
+    amount_matches = AMOUNT_REGEX.findall(line)
+
+    if not date_match or not amount_matches:
+        return None
+
+    date_text = date_match.group(0)
+    amount_text = amount_matches[-1]
+    amount = normalize_amount(amount_text)
+
+    if pd.isna(amount):
+        return None
+
+    tx_type = guess_type_from_text(line)
+    description = clean_description_context(line)
+
+    txn_match = TRANSACTION_ID_REGEX.search(line)
+    txn_id = txn_match.group(1).strip() if txn_match else ""
+
+    return {
+        "transaction_id": txn_id,
+        "date": parse_date(date_text),
+        "amount_raw": amount if tx_type == "income" else -abs(amount),
+        "description": description,
+        "type": tx_type,
+    }
+
+
+def extract_from_text(text: str) -> pd.DataFrame:
+    rows = []
+    for raw_line in str(text).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        row = _parse_line_to_transaction(line)
+        if row:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=STANDARD_COLUMNS)
+
+    return _finalize_transactions(pd.DataFrame(rows), source_name="text")
+
+
+def _extract_pdf_text(file) -> str:
+    if pdfplumber is None:
+        return ""
+
+    text_parts = []
+    file.seek(0)
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            text_parts.append(page_text)
+    file.seek(0)
+    return "\n".join(text_parts)
+
+
+def _extract_pdf_tables(file):
+    if pdfplumber is None:
+        return []
+
+    tables = []
+    file.seek(0)
+    with pdfplumber.open(file) as pdf:
+        for page in pdf.pages:
+            page_tables = page.extract_tables() or []
+            for table in page_tables:
+                if not table or len(table) < 2:
+                    continue
+                header = [str(h).strip() if h is not None else "" for h in table[0]]
+                body = table[1:]
+                try:
+                    temp_df = pd.DataFrame(body, columns=header)
+                except Exception:
+                    continue
+                tables.append(temp_df)
+    file.seek(0)
+    return tables
+
+
+def _parse_transactions_from_blob(text_blob: str) -> pd.DataFrame:
+    rows = []
+    for raw_line in str(text_blob).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        row = _parse_line_to_transaction(line)
+        if row:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=STANDARD_COLUMNS)
+
+    return _finalize_transactions(pd.DataFrame(rows), source_name="pdf")
+
+
+def extract_from_pdf(file) -> pd.DataFrame:
+    all_rows = []
+
+    for table_df in _extract_pdf_tables(file):
+        try:
+            standardized = _standardize_dataframe(table_df, source_name="pdf")
+            if not standardized.empty:
+                all_rows.append(standardized)
+        except Exception:
+            continue
+
+    if all_rows:
+        combined = pd.concat(all_rows, ignore_index=True)
+        combined = combined.drop_duplicates().reset_index(drop=True)
+        return combined
+
+    text_blob = _extract_pdf_text(file)
+    return _parse_transactions_from_blob(text_blob)
+
+
+def combine_sources(dfs: List[pd.DataFrame]) -> pd.DataFrame:
+    valid_dfs = [df.copy() for df in dfs if df is not None and not df.empty]
+    if not valid_dfs:
+        return pd.DataFrame(columns=STANDARD_COLUMNS)
+
+    combined = pd.concat(valid_dfs, ignore_index=True)
+    combined = combined.sort_values("date", ascending=True, na_position="last").reset_index(drop=True)
+    return combined
+
+
 def enrich_transactions(df: pd.DataFrame, memory_file: str = MEMORY_FILE) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=[
             "transaction_id", "date", "amount", "description", "type", "category",
-            "merchant_norm", "month", "day", "learned_from_memory",
+            "merchant_norm", "source", "month", "day", "learned_from_memory",
             "is_recurring", "is_anomaly", "anomaly_score", "anomaly_reason"
         ])
 
