@@ -1165,12 +1165,11 @@ def calculate_budget_tracking(df: pd.DataFrame, budget_map=None):
 
 def calculate_financial_health_score(df: pd.DataFrame, budget_df=None):
     """
-    Stable score that does not overreact to imperfect ingestion.
-    Score components:
-    - Savings behavior
-    - Budget discipline
-    - Anomaly pressure
-    - Data quality confidence
+    More reliable health score:
+    - weighted by source confidence
+    - penalizes weak data quality
+    - avoids overreacting when income is missing
+    - returns confidence label for jury defensibility
     """
 
     if df is None or df.empty:
@@ -1178,67 +1177,140 @@ def calculate_financial_health_score(df: pd.DataFrame, budget_df=None):
             "health_score": 50,
             "score_band": "Insufficient Data",
             "quality_confidence": 0,
+            "confidence_label": "Low",
             "components": {}
         }
 
-    total_rows = len(df)
-    valid_rows = int((df["valid_row"] == True).sum())
-    valid_ratio = valid_rows / total_rows if total_rows else 0
+    df = df.copy()
 
-    usable = df[df["valid_row"] == True].copy()
-    if usable.empty:
+    total_rows = len(df)
+    valid_df = df[df["valid_row"] == True].copy()
+    valid_rows = len(valid_df)
+
+    if valid_rows == 0:
         return {
             "health_score": 45,
             "score_band": "Low Confidence",
-            "quality_confidence": round(valid_ratio * 100, 1),
+            "quality_confidence": 0,
+            "confidence_label": "Low",
             "components": {
-                "data_quality": round(valid_ratio * 100, 1)
+                "reason": "No valid transactions available"
             }
         }
 
-    income = usable.loc[usable["direction"] == "income", "amount"].sum()
-    expense = usable.loc[usable["direction"] == "expense", "amount"].sum()
-    anomalies = int((usable["is_anomaly"] == True).sum())
+    # -----------------------------
+    # Source reliability weights
+    # -----------------------------
+    source_weights = {
+        "csv": 1.00,
+        "text": 0.85,
+        "pdf": 0.65
+    }
 
-    # 1. Savings behavior
-    if income > 0:
-        savings_rate = max((income - expense) / income, -1)
-        savings_score = max(0, min(100, 50 + savings_rate * 100))
+    valid_df["source_weight"] = valid_df["source"].astype(str).str.lower().map(source_weights).fillna(0.75)
+    valid_df["parse_confidence"] = pd.to_numeric(valid_df["parse_confidence"], errors="coerce").fillna(0.70)
+
+    # final transaction weight
+    valid_df["txn_weight"] = valid_df["source_weight"] * valid_df["parse_confidence"]
+
+    # keep only reasonably trusted rows for score
+    score_df = valid_df[valid_df["txn_weight"] >= 0.45].copy()
+
+    if score_df.empty:
+        return {
+            "health_score": 50,
+            "score_band": "Low Confidence",
+            "quality_confidence": round((valid_rows / total_rows) * 100, 1),
+            "confidence_label": "Low",
+            "components": {
+                "reason": "Transactions parsed, but confidence too weak for reliable scoring"
+            }
+        }
+
+    # -----------------------------
+    # Weighted income / expense
+    # -----------------------------
+    income_df = score_df[score_df["direction"] == "income"].copy()
+    expense_df = score_df[score_df["direction"] == "expense"].copy()
+
+    weighted_income = (income_df["amount"] * income_df["txn_weight"]).sum() if not income_df.empty else 0
+    weighted_expense = (expense_df["amount"] * expense_df["txn_weight"]).sum() if not expense_df.empty else 0
+
+    # detect whether income coverage is trustworthy
+    income_count = len(income_df)
+    expense_count = len(expense_df)
+
+    income_coverage_ok = (income_count >= 1 and weighted_income > 0)
+
+    # -----------------------------
+    # 1. Savings / cashflow score
+    # -----------------------------
+    if income_coverage_ok:
+        savings_rate = max((weighted_income - weighted_expense) / max(weighted_income, 1), -1)
+        cashflow_score = max(0, min(100, 50 + savings_rate * 100))
     else:
-        # fallback for no income data: infer from expense discipline only
-        savings_score = 55 if expense > 0 else 50
+        # neutral fallback if income is weak/missing
+        # do not aggressively punish user for parser weakness
+        if weighted_expense <= 0:
+            cashflow_score = 55
+        else:
+            cashflow_score = 60
 
-    # 2. Budget discipline
+    # -----------------------------
+    # 2. Budget score
+    # -----------------------------
     budget_score = 70
     if budget_df is not None and not budget_df.empty:
-        valid_budget_rows = budget_df[budget_df["budget"] > 0].copy()
+        valid_budget_rows = budget_df[pd.to_numeric(budget_df["budget"], errors="coerce").fillna(0) > 0].copy()
         if not valid_budget_rows.empty:
-            over_budget = (valid_budget_rows["status"] == "Over Budget").mean()
-            near_limit = (valid_budget_rows["status"] == "Near Limit").mean()
-            budget_score = 100 - (over_budget * 45 + near_limit * 20)
+            over_budget_ratio = (valid_budget_rows["status"] == "Over Budget").mean()
+            near_limit_ratio = (valid_budget_rows["status"] == "Near Limit").mean()
+            budget_score = 100 - (over_budget_ratio * 45 + near_limit_ratio * 20)
+            budget_score = max(0, min(100, budget_score))
 
-    # 3. Anomaly pressure
-    expense_count = max(int((usable["direction"] == "expense").sum()), 1)
-    anomaly_ratio = anomalies / expense_count
+    # -----------------------------
+    # 3. Anomaly score
+    # -----------------------------
+    anomaly_count = int((score_df["is_anomaly"] == True).sum())
+    anomaly_base = max(expense_count, 1)
+    anomaly_ratio = anomaly_count / anomaly_base
     anomaly_score = max(0, 100 - anomaly_ratio * 250)
 
-    # 4. Data quality confidence
-    quality_score = valid_ratio * 100
+    # -----------------------------
+    # 4. Data quality score
+    # -----------------------------
+    valid_ratio = valid_rows / total_rows if total_rows else 0
+    avg_conf = score_df["txn_weight"].mean() if not score_df.empty else 0
+    quality_score = ((valid_ratio * 0.5) + (avg_conf * 0.5)) * 100
+    quality_score = max(0, min(100, quality_score))
 
-    # Weighted score
+    # -----------------------------
+    # Penalize if income reliability is weak
+    # -----------------------------
+    income_reliability_penalty = 0
+    if not income_coverage_ok:
+        income_reliability_penalty = 8
+
+    # -----------------------------
+    # Final weighted score
+    # -----------------------------
     raw_score = (
-        0.40 * savings_score +
+        0.40 * cashflow_score +
         0.25 * budget_score +
         0.20 * anomaly_score +
         0.15 * quality_score
-    )
+    ) - income_reliability_penalty
 
-    # Confidence stabilization:
-    # if data quality is weak, pull score toward neutral to avoid misleading confidence
-    confidence_factor = min(max(valid_ratio, 0.35), 1.0)
+    raw_score = max(0, min(100, raw_score))
+
+    # Stabilize toward neutral if quality is weak
+    confidence_factor = min(max(avg_conf, 0.35), 1.0)
     stabilized_score = (raw_score * confidence_factor) + (60 * (1 - confidence_factor))
     final_score = int(round(max(0, min(100, stabilized_score))))
 
+    # -----------------------------
+    # Banding
+    # -----------------------------
     if final_score >= 80:
         band = "Strong"
     elif final_score >= 65:
@@ -1248,20 +1320,33 @@ def calculate_financial_health_score(df: pd.DataFrame, budget_df=None):
     else:
         band = "At Risk"
 
+    # confidence label
+    quality_confidence = round(quality_score, 1)
+    if quality_confidence >= 80:
+        confidence_label = "High"
+    elif quality_confidence >= 60:
+        confidence_label = "Medium"
+    else:
+        confidence_label = "Low"
+
     return {
         "health_score": final_score,
         "score_band": band,
-        "quality_confidence": round(valid_ratio * 100, 1),
+        "quality_confidence": quality_confidence,
+        "confidence_label": confidence_label,
         "components": {
-            "savings_score": round(savings_score, 1),
+            "cashflow_score": round(cashflow_score, 1),
             "budget_score": round(budget_score, 1),
             "anomaly_score": round(anomaly_score, 1),
             "data_quality_score": round(quality_score, 1),
-            "income": round(float(income), 2),
-            "expense": round(float(expense), 2),
-            "anomaly_count": int(anomalies),
+            "weighted_income": round(float(weighted_income), 2),
+            "weighted_expense": round(float(weighted_expense), 2),
+            "anomaly_count": anomaly_count,
             "valid_transaction_count": int(valid_rows),
+            "score_transaction_count": int(len(score_df)),
             "total_parsed_rows": int(total_rows),
+            "income_detected": bool(income_coverage_ok),
+            "income_reliability_penalty": income_reliability_penalty
         }
     }
 
