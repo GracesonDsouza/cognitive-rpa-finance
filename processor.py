@@ -1,4 +1,4 @@
-import io
+import os
 import re
 from typing import Optional
 
@@ -8,7 +8,7 @@ from sklearn.ensemble import IsolationForest
 
 try:
     import pdfplumber
-except Exception:  # pragma: no cover
+except Exception:
     pdfplumber = None
 
 
@@ -56,7 +56,50 @@ MERCHANT_PATTERNS = [
     (r"mutual fund|zerodha|groww|sip", "investment"),
 ]
 
-STANDARD_COLUMNS = ["date", "amount", "description", "type", "category", "merchant_norm"]
+STANDARD_COLUMNS = [
+    "transaction_id", "date", "amount", "description", "type",
+    "category", "merchant_norm", "month", "day"
+]
+
+MEMORY_FILE = "user_memory.csv"
+
+
+def ensure_memory_file(memory_file: str = MEMORY_FILE):
+    if not os.path.exists(memory_file):
+        pd.DataFrame(columns=["merchant_norm", "category", "type"]).to_csv(memory_file, index=False)
+
+
+def load_memory(memory_file: str = MEMORY_FILE) -> pd.DataFrame:
+    ensure_memory_file(memory_file)
+    try:
+        mem = pd.read_csv(memory_file)
+        if mem.empty:
+            return pd.DataFrame(columns=["merchant_norm", "category", "type"])
+        mem["merchant_norm"] = mem["merchant_norm"].astype(str).str.strip().str.lower()
+        mem["category"] = mem["category"].astype(str).str.strip()
+        mem["type"] = mem["type"].astype(str).str.strip().str.lower()
+        mem = mem.drop_duplicates(subset=["merchant_norm"], keep="last")
+        return mem
+    except Exception:
+        return pd.DataFrame(columns=["merchant_norm", "category", "type"])
+
+
+def save_memory_entry(merchant_norm: str, category: str, tx_type: str, memory_file: str = MEMORY_FILE):
+    ensure_memory_file(memory_file)
+    merchant_norm = str(merchant_norm).strip().lower()
+    category = str(category).strip()
+    tx_type = str(tx_type).strip().lower()
+
+    mem = load_memory(memory_file)
+    new_row = pd.DataFrame([{
+        "merchant_norm": merchant_norm,
+        "category": category,
+        "type": tx_type
+    }])
+
+    mem = pd.concat([mem, new_row], ignore_index=True)
+    mem = mem.drop_duplicates(subset=["merchant_norm"], keep="last")
+    mem.to_csv(memory_file, index=False)
 
 
 def normalize_amount(x) -> Optional[float]:
@@ -128,7 +171,11 @@ def normalize_merchant(description: str) -> str:
             return canonical
 
     text = re.sub(r"[^a-z0-9\s]", " ", text)
-    text = re.sub(r"\b(upi|neft|imps|debit|credit|txn|ref|utr|via|to|from|paid|payment|purchase|sent|received)\b", " ", text)
+    text = re.sub(
+        r"\b(upi|neft|imps|debit|credit|txn|ref|utr|via|to|from|paid|payment|purchase|sent|received)\b",
+        " ",
+        text,
+    )
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return "unknown"
@@ -157,6 +204,18 @@ def _find_column(columns, candidates):
     return None
 
 
+def _infer_type_from_row(row) -> str:
+    amount = row.get("amount_raw", np.nan)
+    desc = str(row.get("description", ""))
+
+    if pd.notna(amount):
+        if amount < 0:
+            return "expense"
+        if amount > 0 and any(k in desc.lower() for k in INCOME_KEYWORDS):
+            return "income"
+    return guess_type_from_text(desc)
+
+
 def _standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     df = raw_df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -167,8 +226,11 @@ def _standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     type_col = _find_column(df.columns, ["type", "dr/cr", "transaction type", "nature"])
     credit_col = _find_column(df.columns, ["credit", "deposit"])
     debit_col = _find_column(df.columns, ["debit", "withdrawal", "spent"])
+    transaction_id_col = _find_column(df.columns, ["transaction id", "txn id", "transactionid", "txn_ref", "reference", "utr", "ref no", "txn no", "id"])
 
     standardized = pd.DataFrame()
+
+    standardized["transaction_id"] = df[transaction_id_col].astype(str).str.strip() if transaction_id_col else ""
     standardized["date"] = df[date_col].apply(parse_date) if date_col else pd.NaT
 
     if amount_col:
@@ -187,7 +249,7 @@ def _standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     if desc_col:
         standardized["description"] = df[desc_col].astype(str)
     else:
-        text_cols = [c for c in df.columns if c not in {date_col, amount_col, type_col, credit_col, debit_col}]
+        text_cols = [c for c in df.columns if c not in {date_col, amount_col, type_col, credit_col, debit_col, transaction_id_col}]
         standardized["description"] = df[text_cols].astype(str).agg(" | ".join, axis=1) if text_cols else "Transaction"
 
     if type_col:
@@ -200,20 +262,13 @@ def _standardize_dataframe(raw_df: pd.DataFrame) -> pd.DataFrame:
     return _finalize_transactions(standardized)
 
 
-def _infer_type_from_row(row) -> str:
-    amount = row.get("amount_raw", np.nan)
-    desc = str(row.get("description", ""))
-
-    if pd.notna(amount):
-        if amount < 0:
-            return "expense"
-        if amount > 0 and any(k in desc.lower() for k in INCOME_KEYWORDS):
-            return "income"
-    return guess_type_from_text(desc)
-
-
 def _finalize_transactions(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    if "transaction_id" not in out.columns:
+        out["transaction_id"] = ""
+    out["transaction_id"] = out["transaction_id"].fillna("").astype(str).str.strip()
+
     if "date" not in out.columns:
         out["date"] = pd.NaT
     out["date"] = out["date"].apply(parse_date)
@@ -243,19 +298,46 @@ def _finalize_transactions(df: pd.DataFrame) -> pd.DataFrame:
     out = out[out["amount"] > 0].copy()
     out = out.sort_values("date", ascending=True, na_position="last").reset_index(drop=True)
 
-    return out[[c for c in ["date", "amount", "description", "type", "category", "merchant_norm", "month", "day"] if c in out.columns]]
+    final_cols = [c for c in STANDARD_COLUMNS if c in out.columns]
+    return out[final_cols]
 
 
-def load_csv(file) -> pd.DataFrame:
-    df = pd.read_csv(file)
-    return _standardize_dataframe(df)
+def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    # First priority: transaction ID if available
+    has_txn_id = out["transaction_id"].fillna("").astype(str).str.strip() != ""
+    with_id = out[has_txn_id].copy()
+    without_id = out[~has_txn_id].copy()
+
+    if not with_id.empty:
+        with_id = with_id.drop_duplicates(subset=["transaction_id"], keep="first")
+
+    # Fallback duplicate logic when no transaction ID exists
+    if not without_id.empty:
+        without_id = without_id.drop_duplicates(
+            subset=["date", "amount", "merchant_norm", "type"],
+            keep="first"
+        )
+
+    out = pd.concat([with_id, without_id], ignore_index=True)
+    out = out.sort_values("date", ascending=True, na_position="last").reset_index(drop=True)
+    return out
 
 
 DATE_REGEX = re.compile(
     r"(\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\d{4}-\d{2}-\d{2}\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b)",
     flags=re.IGNORECASE,
 )
+
 AMOUNT_REGEX = re.compile(r"(?:₹|INR|Rs\.?\s*)?\s*-?\d[\d,]*(?:\.\d{1,2})?", flags=re.IGNORECASE)
+
+TRANSACTION_ID_REGEX = re.compile(
+    r"(?i)(?:txn(?:action)?\s*id|txn\s*ref|utr|ref(?:erence)?\s*no|txn\s*no)[:\s\-]*([A-Za-z0-9\-_\/]+)"
+)
 
 
 def _parse_line_to_transaction(line: str):
@@ -276,7 +358,11 @@ def _parse_line_to_transaction(line: str):
     tx_type = guess_type_from_text(line)
     description = clean_description_context(line)
 
+    txn_match = TRANSACTION_ID_REGEX.search(line)
+    txn_id = txn_match.group(1).strip() if txn_match else ""
+
     return {
+        "transaction_id": txn_id,
         "date": parse_date(date_text),
         "amount_raw": amount if tx_type == "income" else -abs(amount),
         "description": description,
@@ -359,11 +445,55 @@ def extract_from_pdf(file) -> pd.DataFrame:
 
     if all_rows:
         combined = pd.concat(all_rows, ignore_index=True)
-        combined = combined.drop_duplicates(subset=["date", "amount", "description", "type"]).reset_index(drop=True)
+        combined = combined.drop_duplicates().reset_index(drop=True)
         return combined
 
     text_blob = _extract_pdf_text(file)
     return _parse_transactions_from_blob(text_blob)
+
+
+def load_csv(file) -> pd.DataFrame:
+    df = pd.read_csv(file)
+    return _standardize_dataframe(df)
+
+
+def apply_memory_learning(df: pd.DataFrame, memory_df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty or memory_df is None or memory_df.empty:
+        if df is not None and not df.empty:
+            df["learned_from_memory"] = False
+        return df
+
+    out = df.copy()
+    out["merchant_norm"] = out["merchant_norm"].astype(str).str.lower().str.strip()
+    out["learned_from_memory"] = False
+
+    mem_map = memory_df.set_index("merchant_norm")[["category", "type"]].to_dict("index")
+
+    for idx in out.index:
+        merchant = out.at[idx, "merchant_norm"]
+        if merchant in mem_map:
+            out.at[idx, "category"] = mem_map[merchant]["category"]
+            out.at[idx, "type"] = mem_map[merchant]["type"]
+            out.at[idx, "learned_from_memory"] = True
+
+    return out
+
+
+def get_uncertain_transactions(df: pd.DataFrame, memory_df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    memory_merchants = set()
+    if memory_df is not None and not memory_df.empty:
+        memory_merchants = set(memory_df["merchant_norm"].astype(str).str.lower().str.strip())
+
+    uncertain = df[
+        (df["merchant_norm"].str.lower().str.strip().isin(memory_merchants) == False) &
+        ((df["category"] == "Other") | (df["merchant_norm"].isin(["unknown", "investment", "electricity bill"])))
+    ].copy()
+
+    uncertain = uncertain.drop_duplicates(subset=["merchant_norm"], keep="first")
+    return uncertain
 
 
 def detect_recurring(df: pd.DataFrame) -> pd.DataFrame:
@@ -391,7 +521,10 @@ def detect_recurring(df: pd.DataFrame) -> pd.DataFrame:
     )
     stats["amount_std"] = stats["amount_std"].fillna(0)
     stats["cv"] = stats["amount_std"] / stats["amount_mean"].replace(0, np.nan)
-    recurring_merchants = stats[(stats["month_count"] >= 2) & ((stats["cv"] <= 0.20) | (stats["tx_count"] >= 3))]["merchant_norm"].tolist()
+    recurring_merchants = stats[
+        (stats["month_count"] >= 2) &
+        ((stats["cv"] <= 0.20) | (stats["tx_count"] >= 3))
+    ]["merchant_norm"].tolist()
 
     out.loc[out["merchant_norm"].isin(recurring_merchants) & (out["type"] == "expense"), "is_recurring"] = True
     return out
@@ -403,7 +536,7 @@ def _build_anomaly_reason(row, amount_threshold, rare_merchants):
         reasons.append("high-value expense")
     if row["merchant_norm"] in rare_merchants:
         reasons.append("rare merchant")
-    if row.get("is_recurring", False) is False and row["category"] in {"Shopping", "Travel", "Other"}:
+    if row.get("is_recurring", False) is False and row["category"] in {"Shopping", "Travel", "Other", "Investment"}:
         reasons.append("unusual spending pattern")
     return ", ".join(reasons) if reasons else "model flagged unusual expense"
 
@@ -464,13 +597,20 @@ def detect_anomalies(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def enrich_transactions(df: pd.DataFrame) -> pd.DataFrame:
+def enrich_transactions(df: pd.DataFrame, memory_file: str = MEMORY_FILE) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=[
-            "date", "amount", "description", "type", "category", "merchant_norm",
-            "month", "day", "is_recurring", "is_anomaly", "anomaly_score", "anomaly_reason"
+            "transaction_id", "date", "amount", "description", "type", "category",
+            "merchant_norm", "month", "day", "learned_from_memory",
+            "is_recurring", "is_anomaly", "anomaly_score", "anomaly_reason"
         ])
 
-    out = detect_recurring(df)
+    out = df.copy()
+    out = remove_duplicates(out)
+
+    memory_df = load_memory(memory_file)
+    out = apply_memory_learning(out, memory_df)
+    out = detect_recurring(out)
     out = detect_anomalies(out)
+
     return out.sort_values("date", ascending=True, na_position="last").reset_index(drop=True)
